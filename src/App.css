@@ -100,10 +100,85 @@ button {
   white-space: pre-wrap;
 }
 
-.warnings {
+.head-hint {
+  font-size: 0.8em;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.segmented-row {
+  display: flex;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+}
+
+.segmented-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.segmented-label {
+  font-size: var(--fs-label);
+  font-weight: 600;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.segmented {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--seg-bg);
+}
+
+.segmented-option {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: var(--fs-mono);
+  font-weight: 500;
+  padding: 5px 10px;
+}
+
+.segmented-option:not(:first-child) {
+  border-left: 1px solid var(--border);
+}
+
+.segmented-option:hover:not(:disabled) {
+  border-color: var(--btn-bd);
+}
+
+.segmented-option-active {
+  background: var(--sel);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.segmented-option:disabled {
+  color: var(--dim);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.banner {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  border-radius: 7px;
+  padding: 8px 12px;
+  font-size: 0.9em;
+  line-height: 1.45;
+  margin: 0 0 0.75rem;
+}
+
+.banner-warning {
+  border: 1px solid var(--yellow-bd);
+  background: var(--yellow-bg);
   color: var(--yellow);
-  margin: 0 0 1rem;
-  padding-left: 1.2rem;
 }
 
 .results {
@@ -178,6 +253,26 @@ button {
 .path {
   flex: 1;
   overflow-wrap: anywhere;
+}
+
+.badge {
+  font-family: var(--font-ui);
+  font-size: var(--fs-badge);
+  border-radius: 9px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+
+.badge-untracked {
+  background: var(--seg-bg);
+  color: var(--muted);
+}
+
+.file-row-omitted {
+  padding: 0.4rem 0.75rem;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  color: var(--muted);
 }
 
 .stats {

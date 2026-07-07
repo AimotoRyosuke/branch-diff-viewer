@@ -1,16 +1,34 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-import type { DiffFile, DiffParams, DiffSummary, FileContents } from "./types";
+import type {
+  CompareMode,
+  DiffFile,
+  DiffParams,
+  DiffSummary,
+  FileContents,
+  RepoInfo,
+  SourceScope,
+} from "./types";
 import { MonacoDiffView } from "./MonacoDiffView";
 
 type Theme = "light" | "dark";
+
+/** Whether `source` (short or fully-qualified) is the checked-out branch
+ * (DESIGN.md 3.3 HEAD constraint). Mirrors the Rust-side
+ * `source_matches_head` in src-tauri/src/git_service/commands.rs. */
+function sourceMatchesHead(source: string, currentBranch: string | null): boolean {
+  if (!currentBranch) return false;
+  return source === currentBranch || source === `refs/heads/${currentBranch}`;
+}
 
 function App() {
   const [theme, setTheme] = useState<Theme>("light");
   const [repoPath, setRepoPath] = useState("");
   const [target, setTarget] = useState("main");
   const [source, setSource] = useState("");
+  const [sourceScope, setSourceScope] = useState<SourceScope>("committed");
+  const [compareMode, setCompareMode] = useState<CompareMode>("merge-base");
   const [summary, setSummary] = useState<DiffSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -23,10 +41,42 @@ function App() {
   const [fileLoading, setFileLoading] = useState(false);
   const [lastParams, setLastParams] = useState<DiffParams | null>(null);
 
+  // RepoInfo (in particular `currentBranch`) drives the HEAD-constraint UI
+  // lock on Staged/Unstaged (DESIGN.md 3.3). Re-validated whenever the repo
+  // path changes; failures are swallowed here (the main `error` banner from
+  // `showDiff` is the primary error surface).
+  const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
+
   // Drive both app CSS ([data-theme]) and Monaco theme from one toggle.
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!repoPath) {
+      setRepoInfo(null);
+      return;
+    }
+    invoke<RepoInfo>("validate_repo", { path: repoPath })
+      .then((info) => {
+        if (!cancelled) setRepoInfo(info);
+      })
+      .catch(() => {
+        if (!cancelled) setRepoInfo(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoPath]);
+
+  const isSourceHead = sourceMatchesHead(source, repoInfo?.currentBranch ?? null);
+  const scopeLocked = !isSourceHead;
+  const lockReason = scopeLocked
+    ? `"${source || "(source)"}" is not the checked-out branch (HEAD is ${
+        repoInfo?.currentBranch ?? "detached/unknown"
+      }) — staged and unstaged changes only exist in the working tree of HEAD.`
+    : undefined;
 
   async function showDiff() {
     setLoading(true);
@@ -40,8 +90,8 @@ function App() {
         repoPath,
         target,
         source,
-        compareMode: "merge-base",
-        sourceScope: "committed",
+        compareMode,
+        sourceScope,
         options: {},
       };
       const result = await invoke<DiffSummary>("get_diff_summary", { params });
@@ -120,7 +170,41 @@ function App() {
             onChange={(e) => setSource(e.currentTarget.value)}
             placeholder="feature/foo"
           />
+          {repoInfo?.currentBranch && (
+            <span className="head-hint">HEAD: {repoInfo.currentBranch}</span>
+          )}
         </label>
+
+        <div className="segmented-row">
+          <div className="segmented-group">
+            <span className="segmented-label">Source scope</span>
+            <SegmentedControl<SourceScope>
+              value={sourceScope}
+              onChange={setSourceScope}
+              options={[
+                { value: "committed", label: "Committed" },
+                { value: "staged", label: "Staged", disabled: scopeLocked, title: lockReason },
+                { value: "unstaged", label: "Unstaged", disabled: scopeLocked, title: lockReason },
+              ]}
+            />
+          </div>
+          <div className="segmented-group">
+            <span className="segmented-label">Compare</span>
+            <SegmentedControl<CompareMode>
+              value={compareMode}
+              onChange={setCompareMode}
+              options={[
+                { value: "merge-base", label: "merge-base" },
+                { value: "tips", label: "tips" },
+              ]}
+            />
+          </div>
+        </div>
+
+        {scopeLocked && sourceScope !== "committed" && (
+          <p className="banner banner-warning">{lockReason}</p>
+        )}
+
         <button type="submit" disabled={loading}>
           {loading ? "Loading…" : "Show diff"}
         </button>
@@ -130,19 +214,14 @@ function App() {
 
       {summary && (
         <section className="results">
-          {summary.warnings.length > 0 && (
-            <ul className="warnings">
-              {summary.warnings.map((w, i) => (
-                <li key={i}>{w}</li>
-              ))}
-            </ul>
-          )}
+          {summary.warnings.map((w, i) => (
+            <p key={i} className="banner banner-warning">
+              {w}
+            </p>
+          ))}
           <p className="totals">
             {summary.summary.filesChanged} files changed, +{summary.summary.additions} -
             {summary.summary.deletions}
-            {typeof summary.omittedUntracked === "number" && summary.omittedUntracked > 0
-              ? ` (+${summary.omittedUntracked} more untracked)`
-              : ""}
           </p>
           <ul className="file-list">
             {summary.files.map((f) => (
@@ -153,6 +232,11 @@ function App() {
                 onSelect={() => loadFileDiff(f, false)}
               />
             ))}
+            {typeof summary.omittedUntracked === "number" && summary.omittedUntracked > 0 && (
+              <li className="file-row file-row-omitted">
+                +{summary.omittedUntracked} more (untracked)
+              </li>
+            )}
           </ul>
 
           <FileDiffPane
@@ -186,6 +270,7 @@ function FileRow({
         <span className="path">
           {file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}
         </span>
+        {file.isUntracked && <span className="badge badge-untracked">untracked</span>}
         {file.isBinary ? (
           <span className="stats binary">binary</span>
         ) : (
@@ -196,6 +281,40 @@ function FileRow({
         )}
       </button>
     </li>
+  );
+}
+
+interface SegmentedOption<T extends string> {
+  value: T;
+  label: string;
+  disabled?: boolean;
+  title?: string;
+}
+
+function SegmentedControl<T extends string>({
+  value,
+  onChange,
+  options,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  options: SegmentedOption<T>[];
+}) {
+  return (
+    <div className="segmented">
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          className={`segmented-option${value === opt.value ? " segmented-option-active" : ""}`}
+          disabled={opt.disabled}
+          title={opt.disabled ? opt.title : undefined}
+          onClick={() => onChange(opt.value)}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
   );
 }
 

@@ -49,7 +49,10 @@ pub struct NumstatEntry {
 
 /// Splits a NUL-terminated byte stream into UTF-8 (lossy) tokens, dropping
 /// the trailing empty token produced by the final terminator.
-fn split_nul(bytes: &[u8]) -> Vec<String> {
+///
+/// `pub(crate)` so `commands.rs` can reuse it for `git ls-files -z` output
+/// (untracked file listing, DESIGN.md 3.3).
+pub(crate) fn split_nul(bytes: &[u8]) -> Vec<String> {
     bytes
         .split(|b| *b == 0)
         .filter(|chunk| !chunk.is_empty())

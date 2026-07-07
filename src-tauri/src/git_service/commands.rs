@@ -6,12 +6,14 @@
 //! through `Command`'s argv array (never a shell) with a trailing `--`
 //! pathspec separator on every `diff` invocation (DESIGN.md 4.0 / 8).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use super::parse::{merge_entries, parse_name_status, parse_numstat};
+use super::parse::{merge_entries, parse_name_status, parse_numstat, split_nul};
 use super::process::{git_version, run_git, stderr_trimmed, stdout_trimmed};
 use super::types::{
-    CompareMode, DiffParams, DiffSummary, DiffTotals, FileContents, RepoInfo, SourceScope,
+    CompareMode, DiffFile, DiffFileStatus, DiffParams, DiffSummary, DiffTotals, FileContents,
+    RepoInfo, SourceScope,
 };
 
 const DIFF_GLOBAL_ARGS: &[&str] = &["-c", "core.quotepath=false", "-c", "core.fsmonitor=false"];
@@ -21,6 +23,8 @@ const DIFF_COMMON_ARGS: &[&str] = &["diff", "--no-color", "--no-ext-diff", "-M",
 const MAX_FILE_DIFF_BYTES: u64 = 1_048_576;
 /// Bytes inspected for a NUL byte to decide `isBinary` (DESIGN.md 4.4 task step 1).
 const BINARY_SNIFF_BYTES: usize = 8000;
+/// Max untracked entries merged into the file list (DESIGN.md 3.3 / 7).
+const UNTRACKED_LIMIT: usize = 100;
 
 #[tauri::command]
 pub fn validate_repo(path: String) -> Result<RepoInfo, String> {
@@ -93,17 +97,6 @@ fn validate_repo_impl(path: &str) -> Result<RepoInfo, String> {
 }
 
 fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
-    if params.compare_mode != CompareMode::MergeBase {
-        return Err(
-            "this build only supports compareMode=\"merge-base\" (Phase 1 scope)".to_string(),
-        );
-    }
-    if params.source_scope != SourceScope::Committed {
-        return Err(
-            "this build only supports sourceScope=\"committed\" (Phase 1 scope)".to_string(),
-        );
-    }
-
     let repo = Path::new(&params.repo_path);
     let meta = std::fs::metadata(repo).map_err(|e| format!("repoPath not accessible: {e}"))?;
     if !meta.is_dir() {
@@ -112,8 +105,44 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
 
     let mut warnings = Vec::new();
 
-    let mb = compute_merge_base(repo, &params.target, &params.source, &mut warnings)?;
+    // HEAD constraint (DESIGN.md 3.3 / 4.1 / 4.2): staged/unstaged only exist
+    // in the working tree of whatever is currently checked out. If `source`
+    // isn't that branch (always true for a remote-tracking ref), fall back
+    // to `committed` rather than erroring, and say so.
+    let mut effective_scope = params.source_scope;
+    if effective_scope != SourceScope::Committed {
+        let current_branch = symbolic_ref_short(repo)?;
+        if !source_matches_head(&params.source, current_branch.as_deref()) {
+            warnings.push(format!(
+                "source \"{}\" is not the checked-out branch (HEAD is {}) — scope fixed to committed",
+                params.source,
+                current_branch.as_deref().unwrap_or("detached"),
+            ));
+            effective_scope = SourceScope::Committed;
+        }
+    }
+
+    // First operand of the diff: the merge-base commit (3-dot) or the target
+    // tip itself (2-dot) — DESIGN.md 4.1/4.2.
+    let base_rev = match params.compare_mode {
+        CompareMode::MergeBase => {
+            compute_merge_base(repo, &params.target, &params.source, &mut warnings)?
+        }
+        CompareMode::Tips => Some(params.target.clone()),
+    };
+    let Some(base_rev) = base_rev else {
+        // No merge base (unrelated histories): DESIGN.md 7 says this is a
+        // warning, not an error — return an empty file list.
+        return Ok(DiffSummary {
+            files: Vec::new(),
+            summary: DiffTotals { files_changed: 0, additions: 0, deletions: 0 },
+            omitted_untracked: None,
+            warnings,
+        });
+    };
+
     let ignore_whitespace = params.options.ignore_whitespace.unwrap_or(true);
+    let scope_args = scope_diff_args(effective_scope, &base_rev, &params.source);
 
     // `-w` is intentionally never passed to `--name-status`: empirically (git
     // 2.50) `--name-status -w` still lists whitespace-only-changed files
@@ -123,7 +152,7 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
     // drops those files. `merge_entries` reconciles the two by path and,
     // when `ignore_whitespace` is set, treats a name-status entry with no
     // numstat match as "hidden by -w" rather than an error (DESIGN.md 3.5).
-    let name_status_out = run_diff(repo, "--name-status", &mb, &params.source, false)?;
+    let name_status_out = run_diff(repo, "--name-status", &scope_args, false)?;
     if !name_status_out.status.success() {
         return Err(format!(
             "git diff --name-status failed: {}",
@@ -131,7 +160,7 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
         ));
     }
 
-    let numstat_out = run_diff(repo, "--numstat", &mb, &params.source, ignore_whitespace)?;
+    let numstat_out = run_diff(repo, "--numstat", &scope_args, ignore_whitespace)?;
     if !numstat_out.status.success() {
         return Err(format!(
             "git diff --numstat failed: {}",
@@ -141,7 +170,22 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
 
     let name_entries = parse_name_status(&name_status_out.stdout)?;
     let numstat_entries = parse_numstat(&numstat_out.stdout)?;
-    let files = merge_entries(name_entries, numstat_entries, ignore_whitespace)?;
+    let mut files = merge_entries(name_entries, numstat_entries, ignore_whitespace)?;
+
+    // Untracked files only exist "in the working tree" and only make sense
+    // to fold in when the scope actually reaches the working tree
+    // (DESIGN.md 3.3 / C-3).
+    let mut omitted_untracked = None;
+    if effective_scope == SourceScope::Unstaged {
+        let all_untracked = list_untracked_paths(repo)?;
+        let omitted = all_untracked.len().saturating_sub(UNTRACKED_LIMIT);
+        if omitted > 0 {
+            omitted_untracked = Some(omitted as u32);
+        }
+        for rel_path in all_untracked.into_iter().take(UNTRACKED_LIMIT) {
+            files.push(build_untracked_entry(repo, &rel_path)?);
+        }
+    }
 
     let mut additions_total: i64 = 0;
     let mut deletions_total: i64 = 0;
@@ -157,57 +201,178 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
             deletions: deletions_total,
         },
         files,
-        omitted_untracked: None,
+        omitted_untracked,
         warnings,
     })
 }
 
-/// `git merge-base <target> <source>`; takes the first line when multiple
-/// merge bases exist (criss-cross merge) and records a warning
-/// (DESIGN.md 4.1 / 7).
+/// Current checked-out branch's short name (`None` on detached/unborn HEAD),
+/// via `symbolic-ref` rather than `--abbrev-ref` (DESIGN.md 4.3 M-5: the
+/// latter returns the literal string `HEAD` when detached).
+fn symbolic_ref_short(repo: &Path) -> Result<Option<String>, String> {
+    let out = run_git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    if out.status.success() {
+        Ok(Some(stdout_trimmed(&out)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether `source` (short or fully-qualified) refers to the branch
+/// currently checked out (DESIGN.md 3.3 HEAD constraint). A detached/unborn
+/// HEAD (`current_branch = None`) never matches.
+fn source_matches_head(source: &str, current_branch: Option<&str>) -> bool {
+    match current_branch {
+        None => false,
+        Some(branch) => source == branch || source == format!("refs/heads/{branch}"),
+    }
+}
+
+/// Builds the diff-subcommand args placed right after the common flags and
+/// before `--` (DESIGN.md 4.1/4.2's per-scope tables).
+fn scope_diff_args(scope: SourceScope, base_rev: &str, source: &str) -> Vec<String> {
+    match scope {
+        SourceScope::Committed => vec![base_rev.to_string(), source.to_string()],
+        SourceScope::Staged => vec!["--cached".to_string(), base_rev.to_string()],
+        SourceScope::Unstaged => vec![base_rev.to_string()],
+    }
+}
+
+/// `git merge-base <target> <source>` (via `--all` so a criss-cross's full
+/// set of candidates can be counted); takes the first line when multiple
+/// merge bases exist and records a warning (DESIGN.md 4.1 / 7). `Ok(None)`
+/// means no merge base exists (unrelated histories) — DESIGN.md 7 treats
+/// that as a warning rather than a hard error.
 fn compute_merge_base(
     repo: &Path,
     target: &str,
     source: &str,
     warnings: &mut Vec<String>,
-) -> Result<String, String> {
-    let out = run_git(repo, &["merge-base", target, source])?;
+) -> Result<Option<String>, String> {
+    let out = run_git(repo, &["merge-base", "--all", target, source])?;
+    let stdout = stdout_trimmed(&out);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     if !out.status.success() {
+        if lines.is_empty() {
+            warnings.push(
+                "no merge base found between target and source (unrelated histories?)"
+                    .to_string(),
+            );
+            return Ok(None);
+        }
         return Err(format!(
-            "git merge-base failed (unrelated histories or unknown ref?): {}",
+            "git merge-base failed: {}",
             stderr_trimmed(&out)
         ));
     }
-    let stdout = stdout_trimmed(&out);
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     match lines.len() {
-        0 => Err("no merge base found between target and source".to_string()),
-        1 => Ok(lines[0].to_string()),
+        0 => {
+            warnings.push(
+                "no merge base found between target and source (unrelated histories?)"
+                    .to_string(),
+            );
+            Ok(None)
+        }
+        1 => Ok(Some(lines[0].to_string())),
         _ => {
             warnings.push(
                 "multiple merge bases found (criss-cross merge); using the first one".to_string(),
             );
-            Ok(lines[0].to_string())
+            Ok(Some(lines[0].to_string()))
         }
     }
+}
+
+/// Lists untracked (non-ignored) paths via `git ls-files --others
+/// --exclude-standard -z` (DESIGN.md 3.3 / 4.3).
+fn list_untracked_paths(repo: &Path) -> Result<Vec<String>, String> {
+    let out = run_git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if !out.status.success() {
+        return Err(format!("git ls-files failed: {}", stderr_trimmed(&out)));
+    }
+    Ok(split_nul(&out.stdout))
+}
+
+/// Builds the synthetic `DiffFile` entry for one untracked path
+/// (DESIGN.md 3.3): `status = added`, `isUntracked = true`, `deletions = 0`,
+/// and `additions` = line count for text files up to the same 1MB size guard
+/// used elsewhere (`None` for binaries or oversized files).
+fn build_untracked_entry(repo: &Path, rel_path: &str) -> Result<DiffFile, String> {
+    let abs_path = repo.join(rel_path);
+    let size = std::fs::metadata(&abs_path)
+        .map_err(|e| format!("failed to stat untracked file '{rel_path}': {e}"))?
+        .len();
+
+    let (is_binary, additions) = if size > MAX_FILE_DIFF_BYTES {
+        // Oversized: only sniff a small prefix for the NUL-byte binary
+        // check; skip reading the whole file just to count lines we won't
+        // report anyway.
+        let prefix = read_prefix(&abs_path, BINARY_SNIFF_BYTES)?;
+        (looks_binary(&prefix), None)
+    } else {
+        let bytes = std::fs::read(&abs_path)
+            .map_err(|e| format!("failed to read untracked file '{rel_path}': {e}"))?;
+        if looks_binary(&bytes) {
+            (true, None)
+        } else {
+            (false, Some(count_lines(&bytes)))
+        }
+    };
+
+    Ok(DiffFile {
+        path: rel_path.to_string(),
+        old_path: None,
+        status: DiffFileStatus::Added,
+        additions,
+        deletions: Some(0),
+        is_binary,
+        is_untracked: Some(true),
+    })
+}
+
+/// Reads up to `limit` bytes from the start of `path`.
+fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open '{}': {e}", path.display()))?;
+    let mut buf = vec![0u8; limit];
+    let n = f
+        .read(&mut buf)
+        .map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Line count used for an untracked file's `additions` (DESIGN.md 3.3): the
+/// number of `\n`-terminated lines, plus one more if the file has trailing
+/// content with no final newline.
+fn count_lines(bytes: &[u8]) -> i64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut count = bytes.iter().filter(|&&b| b == b'\n').count() as i64;
+    if *bytes.last().expect("checked non-empty above") != b'\n' {
+        count += 1;
+    }
+    count
 }
 
 fn run_diff(
     repo: &Path,
     stat_flag: &str,
-    mb: &str,
-    source: &str,
+    scope_args: &[String],
     ignore_whitespace: bool,
 ) -> Result<std::process::Output, String> {
-    let mut args: Vec<&str> = Vec::with_capacity(DIFF_GLOBAL_ARGS.len() + DIFF_COMMON_ARGS.len() + 6);
+    let mut args: Vec<&str> =
+        Vec::with_capacity(DIFF_GLOBAL_ARGS.len() + DIFF_COMMON_ARGS.len() + scope_args.len() + 3);
     args.extend_from_slice(DIFF_GLOBAL_ARGS);
     args.extend_from_slice(DIFF_COMMON_ARGS);
     if ignore_whitespace {
         args.push("-w");
     }
     args.push(stat_flag);
-    args.push(mb);
-    args.push(source);
+    for a in scope_args {
+        args.push(a.as_str());
+    }
     args.push("--");
     run_git(repo, &args)
 }
@@ -255,6 +420,10 @@ fn get_file_diff_impl(
         CompareMode::MergeBase => {
             let mut warnings = Vec::new();
             compute_merge_base(repo, &params.target, &params.source, &mut warnings)?
+                .ok_or_else(|| {
+                    "no merge base found between target and source (unrelated histories?)"
+                        .to_string()
+                })?
         }
         // DESIGN.md 4.1/4.2: "tips" compares against the target branch tip
         // directly rather than the merge-base.
@@ -614,23 +783,363 @@ mod tests {
         assert_eq!(summary2.files.len(), 1);
     }
 
-    #[test]
-    fn get_diff_summary_rejects_unsupported_modes() {
+    // --- Phase 4: full scope × compare-mode matrix, HEAD constraint,
+    // untracked merge-in, and multiple-merge-base warnings ------------------
+
+    /// Runs `git diff <global> <common> [-w] <stat_flag> <scope_args...> --`
+    /// exactly as production code does, for use as the "manual" oracle in
+    /// tests (kept independent of `run_diff`'s own arg list so a regression
+    /// in arg assembly would actually be caught).
+    fn manual_diff_bytes(repo: &Path, stat_flag: &str, scope_args: &[&str]) -> Vec<u8> {
+        let mut args: Vec<&str> = vec![
+            "-c",
+            "core.quotepath=false",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            "-z",
+            stat_flag,
+        ];
+        args.extend_from_slice(scope_args);
+        args.push("--");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(&args)
+            .output()
+            .expect("failed to run manual git diff");
+        assert!(
+            out.status.success(),
+            "manual git diff {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    fn manual_merge_base(repo: &Path, target: &str, source: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["merge-base", target, source])
+            .output()
+            .expect("failed to run git merge-base");
+        assert!(out.status.success(), "git merge-base failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Fixture with a real fork point plus divergence in every layer
+    /// (committed / staged / unstaged / untracked) so every scope×mode
+    /// combination produces a distinguishable result:
+    /// - `main` and `feature` share a common ancestor, then each gets its
+    ///   own commit (`main` grows `main_only.txt`; `feature` changes
+    ///   `shared.txt`) so merge-base and tips diffs differ.
+    /// - `feature` (checked out, i.e. HEAD) additionally gets a staged file,
+    ///   a further unstaged edit on top of the committed change, and an
+    ///   untracked file — so committed/staged/unstaged all disagree too.
+    fn setup_scope_matrix_fixture() -> TempDir {
         let dir = init_repo();
         let repo = dir.path();
-        fs::write(repo.join("a.txt"), "x\n").unwrap();
+
+        fs::write(repo.join("shared.txt"), "base\n").unwrap();
         git(repo, &["add", "."]);
         git(repo, &["commit", "-m", "base"]);
 
-        let mut params = base_params(repo, "main", "main");
-        params.compare_mode = CompareMode::Tips;
-        let err = get_diff_summary_impl(params).unwrap_err();
-        assert!(err.contains("merge-base"));
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("shared.txt"), "feature change\n").unwrap();
+        git(repo, &["commit", "-am", "feature change"]);
 
-        let mut params2 = base_params(repo, "main", "main");
-        params2.source_scope = SourceScope::Unstaged;
-        let err2 = get_diff_summary_impl(params2).unwrap_err();
-        assert!(err2.contains("committed"));
+        git(repo, &["checkout", "main"]);
+        fs::write(repo.join("main_only.txt"), "main only\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "main only"]);
+
+        git(repo, &["checkout", "feature"]);
+        fs::write(repo.join("staged.txt"), "staged content\n").unwrap();
+        git(repo, &["add", "staged.txt"]);
+        fs::write(repo.join("shared.txt"), "feature change + unstaged edit\n").unwrap();
+        fs::write(repo.join("untracked.txt"), "brand new\n").unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn get_diff_summary_matches_manual_git_diff_across_scope_and_compare_mode() {
+        let dir = setup_scope_matrix_fixture();
+        let repo = dir.path();
+
+        for compare_mode in [CompareMode::MergeBase, CompareMode::Tips] {
+            let base_rev = match compare_mode {
+                CompareMode::MergeBase => manual_merge_base(repo, "main", "feature"),
+                CompareMode::Tips => "main".to_string(),
+            };
+
+            for scope in [SourceScope::Committed, SourceScope::Staged, SourceScope::Unstaged] {
+                let mut params = base_params(repo, "main", "feature");
+                params.compare_mode = compare_mode;
+                params.source_scope = scope;
+                params.options.ignore_whitespace = Some(false);
+                let summary = get_diff_summary_impl(params).unwrap();
+                assert!(
+                    summary.warnings.is_empty(),
+                    "unexpected warnings for {compare_mode:?}/{scope:?}: {:?}",
+                    summary.warnings
+                );
+
+                // Manually build the same scope args the production code
+                // should have used, per DESIGN.md 4.1/4.2's tables.
+                let scope_args: Vec<&str> = match scope {
+                    SourceScope::Committed => vec![base_rev.as_str(), "feature"],
+                    SourceScope::Staged => vec!["--cached", base_rev.as_str()],
+                    SourceScope::Unstaged => vec![base_rev.as_str()],
+                };
+                let ns_bytes = manual_diff_bytes(repo, "--name-status", &scope_args);
+                let nu_bytes = manual_diff_bytes(repo, "--numstat", &scope_args);
+                let expected = merge_entries(
+                    parse_name_status(&ns_bytes).unwrap(),
+                    parse_numstat(&nu_bytes).unwrap(),
+                    false,
+                )
+                .unwrap();
+
+                let tracked: Vec<&DiffFile> = summary
+                    .files
+                    .iter()
+                    .filter(|f| f.is_untracked != Some(true))
+                    .collect();
+                assert_eq!(
+                    tracked.len(),
+                    expected.len(),
+                    "{compare_mode:?}/{scope:?}: tracked file count mismatch (got {:#?}, want {:#?})",
+                    tracked,
+                    expected
+                );
+                for ef in &expected {
+                    let af = tracked
+                        .iter()
+                        .find(|f| f.path == ef.path)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{compare_mode:?}/{scope:?}: missing expected file '{}' in {:#?}",
+                                ef.path, tracked
+                            )
+                        });
+                    assert_eq!(af.status, ef.status, "status mismatch for {}", ef.path);
+                    assert_eq!(af.old_path, ef.old_path, "oldPath mismatch for {}", ef.path);
+                    assert_eq!(af.additions, ef.additions, "additions mismatch for {}", ef.path);
+                    assert_eq!(af.deletions, ef.deletions, "deletions mismatch for {}", ef.path);
+                    assert_eq!(af.is_binary, ef.is_binary, "isBinary mismatch for {}", ef.path);
+                }
+
+                // Untracked merge-in only happens for the unstaged scope.
+                if scope == SourceScope::Unstaged {
+                    let untracked: Vec<&str> = summary
+                        .files
+                        .iter()
+                        .filter(|f| f.is_untracked == Some(true))
+                        .map(|f| f.path.as_str())
+                        .collect();
+                    assert_eq!(untracked, vec!["untracked.txt"]);
+                } else {
+                    assert!(
+                        summary.files.iter().all(|f| f.is_untracked != Some(true)),
+                        "{compare_mode:?}/{scope:?} must not merge in untracked files"
+                    );
+                }
+
+                let total_add: i64 = summary.files.iter().map(|f| f.additions.unwrap_or(0)).sum();
+                let total_del: i64 = summary.files.iter().map(|f| f.deletions.unwrap_or(0)).sum();
+                assert_eq!(summary.summary.files_changed, summary.files.len());
+                assert_eq!(summary.summary.additions, total_add);
+                assert_eq!(summary.summary.deletions, total_del);
+            }
+        }
+
+        // `main_only.txt` only shows up when comparing against the target's
+        // tip (compare_mode=Tips), never against the merge-base, since it
+        // postdates the fork point (this is the whole point of merge-base
+        // 3-dot comparison vs. a plain 2-dot tips comparison).
+        let mut mb_params = base_params(repo, "main", "feature");
+        mb_params.compare_mode = CompareMode::MergeBase;
+        mb_params.source_scope = SourceScope::Committed;
+        let mb_summary = get_diff_summary_impl(mb_params).unwrap();
+        assert!(!mb_summary.files.iter().any(|f| f.path == "main_only.txt"));
+
+        let mut tips_params = base_params(repo, "main", "feature");
+        tips_params.compare_mode = CompareMode::Tips;
+        tips_params.source_scope = SourceScope::Committed;
+        let tips_summary = get_diff_summary_impl(tips_params).unwrap();
+        let main_only = tips_summary
+            .files
+            .iter()
+            .find(|f| f.path == "main_only.txt")
+            .expect("tips comparison should surface main_only.txt as deleted from source's side");
+        assert_eq!(main_only.status, DiffFileStatus::Deleted);
+    }
+
+    #[test]
+    fn get_diff_summary_falls_back_to_committed_when_source_is_not_head() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("a.txt"), "feature\n").unwrap();
+        git(repo, &["commit", "-am", "feature change"]);
+
+        // HEAD is now main; "feature" is no longer the checked-out branch, so
+        // staged/unstaged scopes have no working tree to read from.
+        git(repo, &["checkout", "main"]);
+
+        for scope in [SourceScope::Staged, SourceScope::Unstaged] {
+            let mut params = base_params(repo, "main", "feature");
+            params.source_scope = scope;
+            let summary = get_diff_summary_impl(params).unwrap();
+            assert!(
+                summary
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("not the checked-out branch")),
+                "{scope:?}: expected HEAD-constraint warning, got {:?}",
+                summary.warnings
+            );
+            // Falls back to committed: exactly the one committed change,
+            // and no untracked merge-in (that only applies to unstaged).
+            assert_eq!(summary.files.len(), 1);
+            assert_eq!(summary.files[0].path, "a.txt");
+            assert_eq!(summary.files[0].is_untracked, None);
+        }
+
+        // Fully-qualified form of the checked-out branch must NOT trigger
+        // the fallback.
+        git(repo, &["checkout", "feature"]);
+        let mut ok_params = base_params(repo, "main", "refs/heads/feature");
+        ok_params.source_scope = SourceScope::Staged;
+        let ok_summary = get_diff_summary_impl(ok_params).unwrap();
+        assert!(
+            ok_summary.warnings.is_empty(),
+            "fully-qualified HEAD ref should not trigger fallback: {:?}",
+            ok_summary.warnings
+        );
+    }
+
+    #[test]
+    fn get_diff_summary_merges_untracked_files_and_caps_at_100() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        for i in 0..105 {
+            fs::write(
+                repo.join(format!("untracked_{i:03}.txt")),
+                format!("line one\nline two {i}\n"),
+            )
+            .unwrap();
+        }
+
+        let mut params = base_params(repo, "main", "feature");
+        params.source_scope = SourceScope::Unstaged;
+        let summary = get_diff_summary_impl(params).unwrap();
+
+        let untracked: Vec<&DiffFile> =
+            summary.files.iter().filter(|f| f.is_untracked == Some(true)).collect();
+        assert_eq!(untracked.len(), UNTRACKED_LIMIT);
+        assert_eq!(summary.omitted_untracked, Some(5));
+
+        for f in &untracked {
+            assert_eq!(f.status, DiffFileStatus::Added);
+            assert_eq!(f.deletions, Some(0));
+            assert_eq!(f.additions, Some(2));
+            assert!(!f.is_binary);
+        }
+    }
+
+    #[test]
+    fn get_diff_summary_untracked_entries_null_additions_for_binary_and_oversized_files() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        fs::write(repo.join("binary_untracked.bin"), [0u8, 1, 2, 3, 0, 4]).unwrap();
+        let big_content = "x".repeat(MAX_FILE_DIFF_BYTES as usize + 1);
+        fs::write(repo.join("big_untracked.txt"), &big_content).unwrap();
+
+        let mut params = base_params(repo, "main", "feature");
+        params.source_scope = SourceScope::Unstaged;
+        let summary = get_diff_summary_impl(params).unwrap();
+
+        let binary = summary
+            .files
+            .iter()
+            .find(|f| f.path == "binary_untracked.bin")
+            .unwrap();
+        assert!(binary.is_binary);
+        assert_eq!(binary.additions, None);
+        assert_eq!(binary.deletions, Some(0));
+
+        let big = summary
+            .files
+            .iter()
+            .find(|f| f.path == "big_untracked.txt")
+            .unwrap();
+        assert!(!big.is_binary);
+        assert_eq!(big.additions, None);
+        assert_eq!(big.deletions, Some(0));
+    }
+
+    /// Criss-cross fixture (same shape as git's own `t6010-merge-base`
+    /// test, but using non-overlapping files so both merges are conflict
+    /// free): two branches each merge the other's pre-merge tip, so
+    /// `merge-base --all` reports two candidates instead of one.
+    #[test]
+    fn get_diff_summary_warns_on_multiple_merge_bases() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "commit 1"]);
+        git(repo, &["tag", "test1"]);
+
+        fs::write(repo.join("m2.txt"), "m2\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "commit 2"]);
+        git(repo, &["tag", "test2"]);
+
+        git(repo, &["checkout", "-b", "side", "test1"]);
+        fs::write(repo.join("s1.txt"), "s1\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "commit 3"]);
+        git(repo, &["tag", "test3"]);
+
+        git(repo, &["merge", "-m", "merge test2 into side", "test2"]);
+        git(repo, &["tag", "test4"]);
+
+        git(repo, &["checkout", "main"]);
+        git(repo, &["merge", "-m", "merge test3 into main", "test3"]);
+        git(repo, &["tag", "test5"]);
+
+        let params = base_params(repo, "main", "side");
+        let summary = get_diff_summary_impl(params).unwrap();
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("multiple merge bases")),
+            "expected multiple-merge-base warning, got {:?}",
+            summary.warnings
+        );
     }
 
     // --- get_file_diff -----------------------------------------------------
