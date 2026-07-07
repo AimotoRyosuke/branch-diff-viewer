@@ -1,33 +1,50 @@
+/* App styling driven by design tokens (docs/design/tokens.css copied to
+   src/styles/tokens.css). Theme switches via <html data-theme="dark">. */
+
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  line-height: 1.5;
   font-weight: 400;
 
-  color: #0f0f0f;
-  background-color: #f6f6f6;
+  color: var(--text);
+  background-color: var(--bg);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  background-color: var(--bg);
 }
 
 .container {
   margin: 0 auto;
-  max-width: 720px;
-  padding: 2rem;
+  max-width: 1100px;
+  padding: 1.5rem;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
 }
 
 h1 {
-  text-align: center;
+  font-size: 1.4rem;
+  margin: 0;
 }
 
 .diff-form {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+  margin-top: 1rem;
 }
 
 .diff-form label {
@@ -40,15 +57,15 @@ h1 {
 
 input,
 button {
-  border-radius: 8px;
-  border: 1px solid #ccc;
-  padding: 0.6em 1.2em;
+  border-radius: 6px;
+  border: 1px solid var(--btn-bd);
+  padding: 0.5em 0.9em;
   font-size: 1em;
   font-weight: 500;
   font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
+  color: var(--text);
+  background-color: var(--btn-bg);
+  transition: border-color 0.2s;
 }
 
 button {
@@ -57,11 +74,11 @@ button {
 }
 
 button:hover {
-  border-color: #396cd8;
+  border-color: var(--accent);
 }
 button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+  border-color: var(--accent);
+  background-color: var(--sel);
 }
 button:disabled {
   cursor: default;
@@ -73,13 +90,18 @@ button {
   outline: none;
 }
 
+.theme-toggle {
+  align-self: center;
+  white-space: nowrap;
+}
+
 .error {
-  color: #b00020;
+  color: var(--red);
   white-space: pre-wrap;
 }
 
 .warnings {
-  color: #8a6d00;
+  color: var(--yellow);
   margin: 0 0 1rem;
   padding-left: 1.2rem;
 }
@@ -97,13 +119,13 @@ button {
   list-style: none;
   margin: 0;
   padding: 0;
-  border: 1px solid #ddd;
+  border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
 }
 
 .file-row {
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--border2);
 }
 
 .file-row:last-child {
@@ -119,18 +141,18 @@ button {
   border: none;
   border-radius: 0;
   background: transparent;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.9em;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
   text-align: left;
   cursor: pointer;
 }
 
 .file-row-button:hover {
-  background-color: #f0f4ff;
+  background-color: var(--panel);
 }
 
 .file-row-selected .file-row-button {
-  background-color: #e2ebff;
+  background-color: var(--sel);
 }
 
 .status {
@@ -141,16 +163,16 @@ button {
 }
 
 .status-added {
-  color: #1a7f37;
+  color: var(--green);
 }
 .status-deleted {
-  color: #cf222e;
+  color: var(--red);
 }
 .status-modified {
-  color: #9a6700;
+  color: var(--yellow);
 }
 .status-renamed {
-  color: #8250df;
+  color: var(--purple);
 }
 
 .path {
@@ -163,13 +185,13 @@ button {
 }
 
 .additions {
-  color: #1a7f37;
+  color: var(--green);
 }
 .deletions {
-  color: #cf222e;
+  color: var(--red);
 }
 .binary {
-  color: #666;
+  color: var(--muted);
   font-style: italic;
 }
 
@@ -178,73 +200,19 @@ button {
 }
 
 .file-diff-title {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 1em;
   overflow-wrap: anywhere;
 }
 
 .file-diff-notice {
-  color: #666;
+  color: var(--muted);
 }
 
-.file-diff-columns {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.75rem;
-}
-
-.file-diff-pre {
-  margin: 0;
-  padding: 0.75rem;
-  border: 1px solid #ddd;
+.monaco-diff-view {
+  height: 60vh;
+  min-height: 320px;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background-color: #fff;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.85em;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  max-height: 60vh;
-  overflow-y: auto;
-}
-
-.file-diff-pre-label {
-  font-weight: 700;
-  text-transform: uppercase;
-  font-size: 0.75em;
-  color: #666;
-  margin-bottom: 0.4rem;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-    border-color: #555;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-
-  .file-list {
-    border-color: #444;
-  }
-  .file-row {
-    border-bottom-color: #3a3a3a;
-  }
-  .file-row-button:hover {
-    background-color: #333a4d;
-  }
-  .file-row-selected .file-row-button {
-    background-color: #3a4460;
-  }
-  .file-diff-pre {
-    background-color: #1c1c1c;
-    border-color: #444;
-  }
+  overflow: hidden;
 }

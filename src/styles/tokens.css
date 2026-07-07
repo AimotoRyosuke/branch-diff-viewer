@@ -1,0 +1,124 @@
+/**
+ * Branch Diff Viewer — design tokens
+ *
+ * 出典: docs/design/Branch Diff Viewer Prototype.dc.html（ライト/ダーク統合プロトタイプ）
+ * プロトタイプの `.bdv` / `.bdv[data-theme="dark"]` の CSS変数をそのまま正として抽出したもの。
+ * 実装時は src/styles/ 配下へコピーし、<html> または アプリルート要素の
+ * data-theme="dark" 切替でダークテーマを適用する。
+ */
+
+:root {
+  /* ── surfaces ── */
+  --bg: #ffffff;            /* アプリ背景 */
+  --panel: #f6f7f9;         /* ヘッダ・ステータスバー等のパネル背景 */
+  --pane: #fbfcfd;          /* 右ペインのプレースホルダ背景 */
+  --zebra: #f6f7f9;         /* diff の空側（none）行の背景 */
+
+  /* ── borders ── */
+  --border: #d4dae0;        /* 主要な区切り線 */
+  --border2: #eceff2;       /* 弱い区切り線（ドロップダウン内等） */
+
+  /* ── text ── */
+  --text: #1c2128;          /* 本文 */
+  --muted: #59636e;         /* 補助テキスト */
+  --dim: #8b96a3;           /* さらに弱い（ラベル・行番号） */
+  --code: #3c434b;          /* diff コード行 */
+
+  /* ── accent（選択・リンク・フォーカス） ── */
+  --accent: #0b66d0;
+  --accent-text: #0a55ac;
+  --accent-bg: #ddeafe;     /* HEADバッジ等の背景 */
+  --onaccent: #ffffff;      /* accent 上の文字色（チェックボックス✓） */
+  --sel: #e7f0fc;           /* 選択行・アクティブセグメント背景 */
+
+  /* ── status colors（ファイルステータス / 増減行数） ── */
+  --green: #1a7f37;         /* A(dded) / +行数 */
+  --red: #d1242f;           /* D(eleted) / −行数 */
+  --yellow: #9a6700;        /* M(odified) / 警告テキスト */
+  --purple: #8250df;        /* R(enamed) */
+
+  /* ── warning（警告バナー・巨大ファイル・remoteバッジ） ── */
+  --yellow-bg: #fbf0dc;
+  --yellow-bd: #ecd9ab;
+
+  /* ── info（タイムアウト注記・Expand行・Refreshing） ── */
+  --info-bg: #f3f8fd;
+  --info-bd: #dbe9f7;
+  --info-text: #0a3d73;
+
+  /* ── diff line backgrounds ── */
+  --add-bg: #e9f7ee;
+  --add-bd: #d3f2dd;
+  --del-bg: #fdeef0;
+  --del-bd: #f7d4d9;
+  --hunk-bg: #f0f4f8;       /* @@ hunk ヘッダ行 */
+  --hunk-bd: #e3e8ee;
+
+  /* ── controls ── */
+  --btn-bg: #ffffff;
+  --btn-bd: #d4dae0;
+  --seg-bg: #eceff2;        /* セグメントコントロールの地 */
+
+  /* ── misc ── */
+  --shadow: 0 12px 32px rgba(28, 33, 40, 0.18); /* ドロップダウン影 */
+}
+
+[data-theme="dark"] {
+  --bg: #10151b;
+  --panel: #161c23;
+  --pane: #10151b;
+  --zebra: #141a21;
+
+  --border: #2c343e;
+  --border2: #232c38;
+
+  --text: #e3e9ef;
+  --muted: #8b96a3;
+  --dim: #5a6673;
+  --code: #aeb8c2;
+
+  --accent: #4a9eff;
+  --accent-text: #7cbaff;
+  --accent-bg: #173350;
+  --onaccent: #0b1320;
+  --sel: #1d2530;
+
+  --green: #4cc38a;
+  --red: #f27d7d;
+  --yellow: #d9a53e;
+  --purple: #b18cf0;
+
+  --yellow-bg: #3a2c14;
+  --yellow-bd: #5c4a1e;
+
+  --info-bg: #14243a;
+  --info-bd: #1f3a5c;
+  --info-text: #9ccafc;
+
+  --add-bg: #12261a;
+  --add-bd: #1d4029;
+  --del-bg: #2b161b;
+  --del-bd: #522126;
+  --hunk-bg: #182030;
+  --hunk-bd: #232c38;
+
+  --btn-bg: #161c23;
+  --btn-bd: #3a4450;
+  --seg-bg: #10151b;
+
+  --shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+/* ── typography（プロトタイプで実際に使われている組み合わせ） ── */
+:root {
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+
+  --fs-base: 13px;          /* アプリ基本サイズ */
+  --fs-mono: 12px;          /* ファイル一覧・diff・ブランチ名 */
+  --fs-label: 10px;         /* BASE·TARGET 等の大文字ラベル（letter-spacing: .05em） */
+  --fs-badge: 10px;         /* HEAD / remote / untracked バッジ */
+  --fs-statusbar: 11.5px;   /* 下部ステータスバー */
+
+  --lh-diff: 1.75;          /* diff 行の line-height */
+}

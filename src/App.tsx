@@ -1,9 +1,13 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import type { DiffFile, DiffParams, DiffSummary, FileContents } from "./types";
+import { MonacoDiffView } from "./MonacoDiffView";
+
+type Theme = "light" | "dark";
 
 function App() {
+  const [theme, setTheme] = useState<Theme>("light");
   const [repoPath, setRepoPath] = useState("");
   const [target, setTarget] = useState("main");
   const [source, setSource] = useState("");
@@ -18,6 +22,11 @@ function App() {
   const [fileError, setFileError] = useState<string | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
   const [lastParams, setLastParams] = useState<DiffParams | null>(null);
+
+  // Drive both app CSS ([data-theme]) and Monaco theme from one toggle.
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
 
   async function showDiff() {
     setLoading(true);
@@ -70,7 +79,16 @@ function App() {
 
   return (
     <main className="container">
-      <h1>Branch Diff Viewer</h1>
+      <div className="app-header">
+        <h1>Branch Diff Viewer</h1>
+        <button
+          type="button"
+          className="theme-toggle"
+          onClick={() => setTheme((t) => (t === "light" ? "dark" : "light"))}
+        >
+          {theme === "light" ? "Dark" : "Light"} theme
+        </button>
+      </div>
 
       <form
         className="diff-form"
@@ -142,6 +160,7 @@ function App() {
             contents={fileContents}
             loading={fileLoading}
             error={fileError}
+            theme={theme}
             onLoadAnyway={() => selectedFile && loadFileDiff(selectedFile, true)}
           />
         </section>
@@ -185,15 +204,20 @@ function FileDiffPane({
   contents,
   loading,
   error,
+  theme,
   onLoadAnyway,
 }: {
   file: DiffFile | null;
   contents: FileContents | null;
   loading: boolean;
   error: string | null;
+  theme: Theme;
   onLoadAnyway: () => void;
 }) {
   if (!file) return null;
+
+  const showEditor =
+    !loading && !error && contents && !contents.isTooLarge && !contents.isBinary;
 
   return (
     <section className="file-diff-pane">
@@ -215,17 +239,13 @@ function FileDiffPane({
         <p className="file-diff-notice">Binary file</p>
       )}
 
-      {!loading && !error && contents && !contents.isTooLarge && !contents.isBinary && (
-        <div className="file-diff-columns">
-          <pre className="file-diff-pre">
-            <div className="file-diff-pre-label">base</div>
-            {contents.base ?? "(no content — added file)"}
-          </pre>
-          <pre className="file-diff-pre">
-            <div className="file-diff-pre-label">head</div>
-            {contents.head ?? "(no content — deleted file)"}
-          </pre>
-        </div>
+      {showEditor && (
+        <MonacoDiffView
+          path={file.path}
+          original={contents.base ?? ""}
+          modified={contents.head ?? ""}
+          theme={theme}
+        />
       )}
     </section>
   );
