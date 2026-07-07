@@ -105,3 +105,27 @@ pub struct DiffSummary {
     pub omitted_untracked: Option<u32>,
     pub warnings: Vec<String>,
 }
+
+/// Result of `get_file_diff`: both sides' full text for one file
+/// (DESIGN.md chapter 5).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContents {
+    pub path: String,
+    /// `None` for an added file (no base-side content) or when the size
+    /// guard / binary check suppressed content.
+    pub base: Option<String>,
+    /// `None` for a deleted file (no head-side content) or when the size
+    /// guard / binary check suppressed content.
+    pub head: Option<String>,
+    pub is_binary: bool,
+    /// `true` when the 1MB size guard tripped and `force` was not set
+    /// (DESIGN.md 4.3/4.4). `base`/`head` are `None` in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_too_large: Option<bool>,
+    /// Size in bytes of the larger side, present when `isTooLarge` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}

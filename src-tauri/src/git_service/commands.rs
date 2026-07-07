@@ -6,14 +6,21 @@
 //! through `Command`'s argv array (never a shell) with a trailing `--`
 //! pathspec separator on every `diff` invocation (DESIGN.md 4.0 / 8).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::parse::{merge_entries, parse_name_status, parse_numstat};
 use super::process::{git_version, run_git, stderr_trimmed, stdout_trimmed};
-use super::types::{CompareMode, DiffParams, DiffSummary, DiffTotals, RepoInfo, SourceScope};
+use super::types::{
+    CompareMode, DiffParams, DiffSummary, DiffTotals, FileContents, RepoInfo, SourceScope,
+};
 
 const DIFF_GLOBAL_ARGS: &[&str] = &["-c", "core.quotepath=false", "-c", "core.fsmonitor=false"];
 const DIFF_COMMON_ARGS: &[&str] = &["diff", "--no-color", "--no-ext-diff", "-M", "-z"];
+
+/// 1MB size guard threshold (DESIGN.md 4.3/4.4).
+const MAX_FILE_DIFF_BYTES: u64 = 1_048_576;
+/// Bytes inspected for a NUL byte to decide `isBinary` (DESIGN.md 4.4 task step 1).
+const BINARY_SNIFF_BYTES: usize = 8000;
 
 #[tauri::command]
 pub fn validate_repo(path: String) -> Result<RepoInfo, String> {
@@ -23,6 +30,16 @@ pub fn validate_repo(path: String) -> Result<RepoInfo, String> {
 #[tauri::command]
 pub fn get_diff_summary(params: DiffParams) -> Result<DiffSummary, String> {
     get_diff_summary_impl(params)
+}
+
+#[tauri::command]
+pub fn get_file_diff(
+    params: DiffParams,
+    path: String,
+    old_path: Option<String>,
+    force: bool,
+) -> Result<FileContents, String> {
+    get_file_diff_impl(params, path, old_path, force)
 }
 
 fn validate_repo_impl(path: &str) -> Result<RepoInfo, String> {
@@ -193,6 +210,220 @@ fn run_diff(
     args.push(source);
     args.push("--");
     run_git(repo, &args)
+}
+
+/// Where to read one side's (base or head) full text from.
+enum Side {
+    /// A git object reference of the form `<rev>:<path>` or `:<path>`
+    /// (stage 0), read via `git show`/`git cat-file -s`.
+    Blob(String),
+    /// A direct working-tree path (already validated to stay inside the
+    /// repository root), read via `std::fs`.
+    WorkingTree(PathBuf),
+}
+
+/// Outcome of a pre-flight existence/size probe for one [`Side`].
+enum Probe {
+    /// The path does not exist at that revision / in the index / on disk.
+    /// Surfaces as `None` content (added/deleted file) rather than an error
+    /// (DESIGN.md 4.3 task step 1).
+    Missing,
+    Size(u64),
+}
+
+fn get_file_diff_impl(
+    params: DiffParams,
+    path: String,
+    old_path: Option<String>,
+    force: bool,
+) -> Result<FileContents, String> {
+    let repo = Path::new(&params.repo_path);
+    let meta = std::fs::metadata(repo).map_err(|e| format!("repoPath not accessible: {e}"))?;
+    if !meta.is_dir() {
+        return Err("repoPath is not a directory".to_string());
+    }
+
+    // Defense-in-depth (DESIGN.md 8): re-validate path-shaped inputs on the
+    // Rust side regardless of scope, even though only the working-tree read
+    // is a real filesystem traversal risk.
+    validate_repo_relative_path(&path)?;
+    if let Some(op) = &old_path {
+        validate_repo_relative_path(op)?;
+    }
+
+    let base_rev = match params.compare_mode {
+        CompareMode::MergeBase => {
+            let mut warnings = Vec::new();
+            compute_merge_base(repo, &params.target, &params.source, &mut warnings)?
+        }
+        // DESIGN.md 4.1/4.2: "tips" compares against the target branch tip
+        // directly rather than the merge-base.
+        CompareMode::Tips => params.target.clone(),
+    };
+    // Renames read the base side under the old path (task step 1).
+    let base_path = old_path.unwrap_or_else(|| path.clone());
+    let base_side = Side::Blob(format!("{base_rev}:{base_path}"));
+
+    let head_side = match params.source_scope {
+        SourceScope::Committed => Side::Blob(format!("{}:{}", params.source, path)),
+        // Stage 0 of the index (DESIGN.md 4.3).
+        SourceScope::Staged => Side::Blob(format!(":{path}")),
+        SourceScope::Unstaged => {
+            Side::WorkingTree(safe_join_repo_path(repo, &path)?)
+        }
+    };
+
+    let base_probe = probe_side(repo, &base_side)?;
+    let head_probe = probe_side(repo, &head_side)?;
+
+    if !force {
+        let max_size = [&base_probe, &head_probe]
+            .into_iter()
+            .filter_map(|p| match p {
+                Probe::Size(n) => Some(*n),
+                Probe::Missing => None,
+            })
+            .max();
+        if let Some(size) = max_size {
+            if size > MAX_FILE_DIFF_BYTES {
+                return Ok(FileContents {
+                    path,
+                    base: None,
+                    head: None,
+                    is_binary: false,
+                    is_too_large: Some(true),
+                    size_bytes: Some(size),
+                    note: None,
+                });
+            }
+        }
+    }
+
+    let base_bytes = match base_probe {
+        Probe::Missing => None,
+        Probe::Size(_) => Some(read_side(repo, &base_side)?),
+    };
+    let head_bytes = match head_probe {
+        Probe::Missing => None,
+        Probe::Size(_) => Some(read_side(repo, &head_side)?),
+    };
+
+    let is_binary = base_bytes.as_deref().is_some_and(looks_binary)
+        || head_bytes.as_deref().is_some_and(looks_binary);
+
+    if is_binary {
+        return Ok(FileContents {
+            path,
+            base: None,
+            head: None,
+            is_binary: true,
+            is_too_large: None,
+            size_bytes: None,
+            note: None,
+        });
+    }
+
+    Ok(FileContents {
+        path,
+        base: base_bytes.map(|b| String::from_utf8_lossy(&b).into_owned()),
+        head: head_bytes.map(|b| String::from_utf8_lossy(&b).into_owned()),
+        is_binary: false,
+        is_too_large: None,
+        size_bytes: None,
+        note: None,
+    })
+}
+
+/// Rejects absolute paths, `..` traversal, and NUL bytes. Applies to every
+/// path-shaped IPC input regardless of source scope (DESIGN.md 8: Rust
+/// re-validates inputs as the defense layer against a compromised frontend).
+fn validate_repo_relative_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    if path.contains('\0') {
+        return Err("path must not contain a NUL byte".to_string());
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "path must be repository-relative with no traversal: '{path}'"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Joins `path` onto `repo`, rejecting the result if `path` could escape the
+/// repository root (DESIGN.md 4.3: "作業ツリー直読み...パストラバーサル防止").
+fn safe_join_repo_path(repo: &Path, path: &str) -> Result<PathBuf, String> {
+    validate_repo_relative_path(path)?;
+    Ok(repo.join(path))
+}
+
+/// Probes existence and, when present, byte size of one [`Side`] without
+/// reading its full content (DESIGN.md 4.3 size guard).
+fn probe_side(repo: &Path, side: &Side) -> Result<Probe, String> {
+    match side {
+        Side::Blob(spec) => {
+            let out = run_git(repo, &["cat-file", "-s", spec])?;
+            if out.status.success() {
+                let stdout = stdout_trimmed(&out);
+                let size: u64 = stdout
+                    .parse()
+                    .map_err(|_| format!("unexpected `git cat-file -s` output: '{stdout}'"))?;
+                Ok(Probe::Size(size))
+            } else {
+                let err = stderr_trimmed(&out);
+                if is_missing_path_error(&err) {
+                    Ok(Probe::Missing)
+                } else {
+                    Err(format!("git cat-file -s {spec} failed: {err}"))
+                }
+            }
+        }
+        Side::WorkingTree(abs_path) => match std::fs::metadata(abs_path) {
+            Ok(meta) => Ok(Probe::Size(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Probe::Missing),
+            Err(e) => Err(format!("failed to stat working tree file: {e}")),
+        },
+    }
+}
+
+/// Reads the full content of one [`Side`]. Only called after [`probe_side`]
+/// reported it as present.
+fn read_side(repo: &Path, side: &Side) -> Result<Vec<u8>, String> {
+    match side {
+        Side::Blob(spec) => {
+            let out = run_git(repo, &["show", spec])?;
+            if out.status.success() {
+                Ok(out.stdout)
+            } else {
+                Err(format!("git show {spec} failed: {}", stderr_trimmed(&out)))
+            }
+        }
+        Side::WorkingTree(abs_path) => {
+            std::fs::read(abs_path).map_err(|e| format!("failed to read working tree file: {e}"))
+        }
+    }
+}
+
+/// Matches the handful of git error messages that mean "this path does not
+/// exist at that revision / in the index / on disk" rather than a genuine
+/// failure (verified empirically against git 2.50; DESIGN.md task step 1).
+fn is_missing_path_error(stderr: &str) -> bool {
+    stderr.contains("does not exist") || stderr.contains("exists on disk, but not")
+}
+
+/// `isBinary` heuristic: a NUL byte in the first [`BINARY_SNIFF_BYTES`]
+/// bytes (DESIGN.md 4.4 task step 1; matches git's own `--numstat` binary
+/// detection in spirit).
+fn looks_binary(bytes: &[u8]) -> bool {
+    let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
+    bytes[..sniff_len].contains(&0u8)
 }
 
 #[cfg(test)]
@@ -400,5 +631,210 @@ mod tests {
         params2.source_scope = SourceScope::Unstaged;
         let err2 = get_diff_summary_impl(params2).unwrap_err();
         assert!(err2.contains("committed"));
+    }
+
+    // --- get_file_diff -----------------------------------------------------
+
+    /// (a) A normal modified file: both sides fetch their committed full text.
+    #[test]
+    fn get_file_diff_fetches_both_sides_for_a_modified_file() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("modified.txt"), "line1\nline2\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("modified.txt"), "line1\nline2 changed\n").unwrap();
+        git(repo, &["commit", "-am", "feature change"]);
+
+        let params = base_params(repo, "main", "feature");
+        let fc = get_file_diff_impl(params, "modified.txt".to_string(), None, false).unwrap();
+
+        assert_eq!(fc.base.as_deref(), Some("line1\nline2\n"));
+        assert_eq!(fc.head.as_deref(), Some("line1\nline2 changed\n"));
+        assert!(!fc.is_binary);
+        assert_eq!(fc.is_too_large, None);
+    }
+
+    /// (b) Added file: base is None. Deleted file: head is None.
+    #[test]
+    fn get_file_diff_handles_added_and_deleted_files() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("deleted.txt"), "bye\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("added.txt"), "new content\n").unwrap();
+        fs::remove_file(repo.join("deleted.txt")).unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-m", "feature changes"]);
+
+        let params = base_params(repo, "main", "feature");
+
+        let added = get_file_diff_impl(params.clone(), "added.txt".to_string(), None, false)
+            .unwrap();
+        assert_eq!(added.base, None);
+        assert_eq!(added.head.as_deref(), Some("new content\n"));
+
+        let deleted =
+            get_file_diff_impl(params, "deleted.txt".to_string(), None, false).unwrap();
+        assert_eq!(deleted.base.as_deref(), Some("bye\n"));
+        assert_eq!(deleted.head, None);
+    }
+
+    /// (c) Renamed file: base side is fetched under `oldPath`.
+    #[test]
+    fn get_file_diff_uses_old_path_for_base_side_on_rename() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("old_name.txt"), "rename me\nkeep me stable\nline three\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::rename(repo.join("old_name.txt"), repo.join("new_name.txt")).unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-m", "rename"]);
+
+        let params = base_params(repo, "main", "feature");
+        let fc = get_file_diff_impl(
+            params,
+            "new_name.txt".to_string(),
+            Some("old_name.txt".to_string()),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fc.base.as_deref(),
+            Some("rename me\nkeep me stable\nline three\n")
+        );
+        assert_eq!(
+            fc.head.as_deref(),
+            Some("rename me\nkeep me stable\nline three\n")
+        );
+    }
+
+    /// (d) Staged vs unstaged scope must diverge when the index and working
+    /// tree disagree.
+    #[test]
+    fn get_file_diff_distinguishes_staged_from_unstaged_scope() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("divergent.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        // Staged change.
+        fs::write(repo.join("divergent.txt"), "staged\n").unwrap();
+        git(repo, &["add", "divergent.txt"]);
+        // Further unstaged change on top of the staged one.
+        fs::write(repo.join("divergent.txt"), "unstaged\n").unwrap();
+
+        let mut staged_params = base_params(repo, "main", "feature");
+        staged_params.source_scope = SourceScope::Staged;
+        let staged =
+            get_file_diff_impl(staged_params, "divergent.txt".to_string(), None, false).unwrap();
+        assert_eq!(staged.base.as_deref(), Some("base\n"));
+        assert_eq!(staged.head.as_deref(), Some("staged\n"));
+
+        let mut unstaged_params = base_params(repo, "main", "feature");
+        unstaged_params.source_scope = SourceScope::Unstaged;
+        let unstaged =
+            get_file_diff_impl(unstaged_params, "divergent.txt".to_string(), None, false)
+                .unwrap();
+        assert_eq!(unstaged.base.as_deref(), Some("base\n"));
+        assert_eq!(unstaged.head.as_deref(), Some("unstaged\n"));
+    }
+
+    /// (e) A file whose working-tree side exceeds 1MB trips the size guard
+    /// unless `force` is set.
+    #[test]
+    fn get_file_diff_applies_size_guard_and_force_override() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("big.txt"), "small\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        let big_content = "x".repeat(MAX_FILE_DIFF_BYTES as usize + 1);
+        fs::write(repo.join("big.txt"), &big_content).unwrap();
+        // Left unstaged on purpose: sourceScope=Unstaged reads the working tree.
+
+        let mut params = base_params(repo, "main", "feature");
+        params.source_scope = SourceScope::Unstaged;
+
+        let guarded =
+            get_file_diff_impl(params.clone(), "big.txt".to_string(), None, false).unwrap();
+        assert_eq!(guarded.base, None);
+        assert_eq!(guarded.head, None);
+        assert_eq!(guarded.is_too_large, Some(true));
+        assert_eq!(guarded.size_bytes, Some(big_content.len() as u64));
+
+        let forced = get_file_diff_impl(params, "big.txt".to_string(), None, true).unwrap();
+        assert_eq!(forced.base.as_deref(), Some("small\n"));
+        assert_eq!(forced.head.as_deref(), Some(big_content.as_str()));
+        assert_eq!(forced.is_too_large, None);
+    }
+
+    /// (f) Binary content (NUL byte present) suppresses both sides' text and
+    /// sets `isBinary`.
+    #[test]
+    fn get_file_diff_detects_binary_content() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("bin.dat"), "hello\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("bin.dat"), [0u8, 159, 146, 150, 0, 1, 2, 3]).unwrap();
+        git(repo, &["commit", "-am", "binary change"]);
+
+        let params = base_params(repo, "main", "feature");
+        let fc = get_file_diff_impl(params, "bin.dat".to_string(), None, false).unwrap();
+
+        assert!(fc.is_binary);
+        assert_eq!(fc.base, None);
+        assert_eq!(fc.head, None);
+    }
+
+    /// (g) A path escaping the repository root must be rejected, not read.
+    #[test]
+    fn get_file_diff_rejects_path_traversal() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "x\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        let mut params = base_params(repo, "main", "main");
+        params.source_scope = SourceScope::Unstaged;
+
+        let err = get_file_diff_impl(
+            params.clone(),
+            "../../../../etc/passwd".to_string(),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("traversal"), "unexpected error: {err}");
+
+        let err_old_path =
+            get_file_diff_impl(params, "a.txt".to_string(), Some("../secret".to_string()), false)
+                .unwrap_err();
+        assert!(err_old_path.contains("traversal"), "unexpected error: {err_old_path}");
     }
 }

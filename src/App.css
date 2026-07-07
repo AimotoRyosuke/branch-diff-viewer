@@ -103,17 +103,34 @@ button {
 }
 
 .file-row {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.4rem 0.75rem;
   border-bottom: 1px solid #eee;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.9em;
 }
 
 .file-row:last-child {
   border-bottom: none;
+}
+
+.file-row-button {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.4rem 0.75rem;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-row-button:hover {
+  background-color: #f0f4ff;
+}
+
+.file-row-selected .file-row-button {
+  background-color: #e2ebff;
 }
 
 .status {
@@ -156,6 +173,48 @@ button {
   font-style: italic;
 }
 
+.file-diff-pane {
+  margin-top: 1.5rem;
+}
+
+.file-diff-title {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1em;
+  overflow-wrap: anywhere;
+}
+
+.file-diff-notice {
+  color: #666;
+}
+
+.file-diff-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.file-diff-pre {
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  background-color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.file-diff-pre-label {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 0.75em;
+  color: #666;
+  margin-bottom: 0.4rem;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
@@ -177,5 +236,15 @@ button {
   }
   .file-row {
     border-bottom-color: #3a3a3a;
+  }
+  .file-row-button:hover {
+    background-color: #333a4d;
+  }
+  .file-row-selected .file-row-button {
+    background-color: #3a4460;
+  }
+  .file-diff-pre {
+    background-color: #1c1c1c;
+    border-color: #444;
   }
 }
