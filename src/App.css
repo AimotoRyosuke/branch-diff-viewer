@@ -835,6 +835,11 @@ button {
   font-weight: 400;
   font-family: var(--font-mono);
   font-size: var(--fs-mono);
+  /* JS 側で中間省略済み。極端なケース用の保険としての上限幅 */
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .project-chip-arrow {
   color: var(--muted);

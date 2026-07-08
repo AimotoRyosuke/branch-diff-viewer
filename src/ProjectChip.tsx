@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 import { useClickOutside } from "./useClickOutside";
-import { projectName } from "./utils";
+import { projectName, projectParentPath } from "./utils";
 
 /** Control-bar project chip (docs/design "Branch Diff Viewer Prototype.dc.html"
  * control bar). Clicking it opens a small menu to switch projects: choose a
@@ -29,7 +29,9 @@ export function ProjectChip({
       <button type="button" className="project-chip-trigger" onClick={() => setOpen((o) => !o)}>
         <span className="project-chip-icon" aria-hidden="true" />
         <span className="project-chip-name">{projectName(repoPath)}</span>
-        <span className="project-chip-path">{repoPath}</span>
+        <span className="project-chip-path" title={repoPath}>
+          {projectParentPath(repoPath)}
+        </span>
         <span className="project-chip-arrow">▼</span>
       </button>
 
@@ -59,7 +61,9 @@ export function ProjectChip({
                   }}
                 >
                   <span className="project-chip-item-name">{projectName(path)}</span>
-                  <span className="project-chip-item-path">{path}</span>
+                  <span className="project-chip-item-path" title={path}>
+                    {projectParentPath(path, 36)}
+                  </span>
                 </button>
               ))}
             </>

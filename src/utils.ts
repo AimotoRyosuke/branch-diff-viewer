@@ -67,10 +67,116 @@ export function splitPath(path: string): { dir: string; name: string } {
   return { dir: path.slice(0, idx + 1), name: path.slice(idx + 1) };
 }
 
+/** Shared canvas context for `measureText` (avoids re-creating a canvas per
+ * call; the file list re-fits every visible row on resize). */
+let measureCtx: CanvasRenderingContext2D | null = null;
+
+/** Pixel width of `text` rendered in the CSS shorthand `font`. */
+export function measureText(text: string, font: string): number {
+  if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
+  if (!measureCtx) return 0;
+  measureCtx.font = font;
+  return measureCtx.measureText(text).width;
+}
+
+const ELL = "…";
+
+/**
+ * Fits `dir + name` (as produced by `splitPath`) into `maxWidth` px by
+ * omitting, in priority order:
+ *   1. middle directory segments   →  a/b/…/z/name
+ *   2. the directory head          →  …ripts/name
+ *   3. the tail of the file name   →  …/long_file_na…
+ * so the file name stays fully visible until the directory alone can no
+ * longer absorb the overflow.
+ */
+export function fitPath(
+  dir: string,
+  name: string,
+  maxWidth: number,
+  font: string,
+): { dir: string; name: string } {
+  const w = (s: string) => measureText(s, font);
+  if (w(dir + name) <= maxWidth) return { dir, name };
+
+  const nameW = w(name);
+
+  if (dir) {
+    // 1: keep the first `keep` segments and the last one, omit the middle.
+    const segs = dir.slice(0, -1).split("/");
+    const last = segs[segs.length - 1];
+    for (let keep = segs.length - 2; keep >= 1; keep--) {
+      const d = `${segs.slice(0, keep).join("/")}/${ELL}/${last}/`;
+      if (w(d) + nameW <= maxWidth) return { dir: d, name };
+    }
+
+    // 2: omit the directory head, keeping the longest tail that still fits
+    // ("…/" at minimum, mid-segment cuts like "…ripts/" allowed).
+    if (w(ELL + "/") + nameW <= maxWidth) {
+      let lo = 1;
+      let hi = dir.length;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (w(ELL + dir.slice(dir.length - mid)) + nameW <= maxWidth) lo = mid;
+        else hi = mid - 1;
+      }
+      return { dir: ELL + dir.slice(dir.length - lo), name };
+    }
+
+    // The full name still fits with the dir dropped entirely — prefer that
+    // over cutting into the name.
+    if (nameW <= maxWidth) return { dir: "", name };
+  }
+
+  // 3: omit the tail of the file name itself.
+  let dirPart = dir ? ELL + "/" : "";
+  let budget = maxWidth - w(dirPart + ELL);
+  if (budget <= 0) {
+    dirPart = "";
+    budget = maxWidth - w(ELL);
+  }
+  let lo = 0;
+  let hi = name.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (w(name.slice(0, mid)) <= budget) lo = mid;
+    else hi = mid - 1;
+  }
+  if (lo === 0) return { dir: "", name: ELL };
+  return { dir: dirPart, name: name.slice(0, lo) + ELL };
+}
+
 /** Last path segment, used as the display name for a project chip (e.g.
  * "myapp" from "/Users/x/dev/myapp"). */
 export function projectName(path: string): string {
   const trimmed = path.replace(/[/\\]+$/, "");
   const parts = trimmed.split(/[/\\]/);
   return parts[parts.length - 1] || trimmed;
+}
+
+/**
+ * Parent directory of a project path, for display next to the project name
+ * (which already shows the last segment — repeating it would be redundant):
+ * "/Users/x/develop/lincwell/llm-customer-support" → "~/develop/lincwell/".
+ * The home prefix is collapsed to "~", and when the result exceeds
+ * `maxChars` the middle segments are omitted ("~/…/lincwell/"), keeping the
+ * head and the immediate parent visible.
+ */
+export function projectParentPath(path: string, maxChars = 40): string {
+  let p = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const idx = p.lastIndexOf("/");
+  if (idx < 0) return "";
+  p = p.slice(0, idx + 1); // parent, trailing slash kept
+  p = p.replace(/^\/(?:Users|home)\/[^/]+(?=\/)/, "~");
+  if (p.length <= maxChars) return p;
+
+  const segs = p.slice(0, -1).split("/");
+  const last = segs[segs.length - 1];
+  for (let keep = segs.length - 2; keep >= 1; keep--) {
+    const cand = `${segs.slice(0, keep).join("/")}/…/${last}/`;
+    if (cand.length <= maxChars) return cand;
+  }
+  const cand = `…/${last}/`;
+  if (cand.length <= maxChars) return cand;
+  return cand.slice(0, maxChars - 1) + "…";
 }
