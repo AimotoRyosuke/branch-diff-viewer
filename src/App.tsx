@@ -1,7 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import type {
+  BranchList,
+  BranchRef,
   CompareMode,
   DiffFile,
   DiffParams,
@@ -11,64 +14,136 @@ import type {
   SourceScope,
 } from "./types";
 import { MonacoDiffView } from "./MonacoDiffView";
+import { BranchDropdown } from "./BranchDropdown";
+import { ProjectChip } from "./ProjectChip";
+import { EmptyState } from "./EmptyState";
+import { formatBytes } from "./utils";
 
 type Theme = "light" | "dark";
 
-/** Whether `source` (short or fully-qualified) is the checked-out branch
- * (DESIGN.md 3.3 HEAD constraint). Mirrors the Rust-side
- * `source_matches_head` in src-tauri/src/git_service/commands.rs. */
+/** Whether `source` (a fully-qualified ref, as selected via `BranchDropdown`)
+ * is the checked-out branch (DESIGN.md 3.3 HEAD constraint). Mirrors the
+ * Rust-side `source_matches_head` in src-tauri/src/git_service/commands.rs. */
 function sourceMatchesHead(source: string, currentBranch: string | null): boolean {
   if (!currentBranch) return false;
-  return source === currentBranch || source === `refs/heads/${currentBranch}`;
+  return source === `refs/heads/${currentBranch}`;
+}
+
+/** Picks sensible default target/source branches once the branch list loads
+ * (DESIGN.md doesn't prescribe this — a reasonable default keeps the app
+ * usable without forcing the user to pick both every time): target prefers
+ * `main`/`master`, source prefers the checked-out branch. */
+function pickDefaultBranches(branches: BranchList): { target: BranchRef | null; source: BranchRef | null } {
+  const byShort = (name: string) => branches.local.find((b) => b.short === name) ?? null;
+  const target =
+    byShort("main") ??
+    byShort("master") ??
+    branches.local.find((b) => b.short !== branches.current) ??
+    branches.local[0] ??
+    null;
+  const source =
+    (branches.current ? byShort(branches.current) : null) ??
+    branches.local.find((b) => b.full !== target?.full) ??
+    branches.local[0] ??
+    null;
+  return { target, source };
 }
 
 function App() {
   const [theme, setTheme] = useState<Theme>("light");
+
+  // Project selection (DESIGN.md 3.1).
   const [repoPath, setRepoPath] = useState("");
-  const [target, setTarget] = useState("main");
-  const [source, setSource] = useState("");
+  const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
+  const [projectError, setProjectError] = useState<string | null>(null);
+  const [recentProjects, setRecentProjects] = useState<string[]>([]);
+
+  // Branch selection (DESIGN.md 3.2).
+  const [branches, setBranches] = useState<BranchList | null>(null);
+  const [target, setTarget] = useState(""); // fully-qualified ref
+  const [source, setSource] = useState(""); // fully-qualified ref
+
   const [sourceScope, setSourceScope] = useState<SourceScope>("committed");
   const [compareMode, setCompareMode] = useState<CompareMode>("merge-base");
   const [summary, setSummary] = useState<DiffSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // Currently selected file + its lazily-fetched full-text contents
-  // (Phase 3 replaces the <pre> pair below with Monaco Diff View).
+  // Currently selected file + its lazily-fetched full-text contents.
   const [selectedFile, setSelectedFile] = useState<DiffFile | null>(null);
   const [fileContents, setFileContents] = useState<FileContents | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
   const [lastParams, setLastParams] = useState<DiffParams | null>(null);
 
-  // RepoInfo (in particular `currentBranch`) drives the HEAD-constraint UI
-  // lock on Staged/Unstaged (DESIGN.md 3.3). Re-validated whenever the repo
-  // path changes; failures are swallowed here (the main `error` banner from
-  // `showDiff` is the primary error surface).
-  const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
-
   // Drive both app CSS ([data-theme]) and Monaco theme from one toggle.
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
+  // Load the recent-projects list once on startup (DESIGN.md 3.1).
   useEffect(() => {
-    let cancelled = false;
-    if (!repoPath) {
-      setRepoInfo(null);
-      return;
-    }
-    invoke<RepoInfo>("validate_repo", { path: repoPath })
-      .then((info) => {
-        if (!cancelled) setRepoInfo(info);
-      })
+    invoke<string[]>("get_recent_projects")
+      .then(setRecentProjects)
       .catch(() => {
-        if (!cancelled) setRepoInfo(null);
+        /* non-fatal: the empty-state screen just shows no recents */
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [repoPath]);
+  }, []);
+
+  /** Validates `path` as a git repository and, on success, adopts it as the
+   * active project (DESIGN.md 3.1). Used by both the folder-picker dialog
+   * and clicking a recent-project entry. */
+  const validateAndSetRepo = useCallback(async (path: string) => {
+    try {
+      const info = await invoke<RepoInfo>("validate_repo", { path });
+      setRepoInfo(info);
+      setRepoPath(info.toplevel);
+      setProjectError(null);
+      setBranches(null);
+      setTarget("");
+      setSource("");
+      setSummary(null);
+      setSelectedFile(null);
+      setFileContents(null);
+
+      // Fetched directly here (DESIGN.md 3.2), rather than via a `repoPath`-
+      // keyed effect: re-picking the *same* project (e.g. from Recent) would
+      // otherwise leave `branches` stuck at the `null` reset above, since
+      // `repoPath` wouldn't actually change.
+      try {
+        const list = await invoke<BranchList>("list_branches", { path: info.toplevel });
+        setBranches(list);
+      } catch (e) {
+        setError(String(e));
+      }
+
+      const updated = await invoke<string[]>("add_recent_project", { path: info.toplevel });
+      setRecentProjects(updated);
+    } catch (e) {
+      setProjectError(String(e));
+    }
+  }, []);
+
+  const chooseRepository = useCallback(async () => {
+    const selection = await open({ directory: true, multiple: false });
+    if (typeof selection === "string") {
+      await validateAndSetRepo(selection);
+    }
+  }, [validateAndSetRepo]);
+
+  // Fill in default target/source once branches load, if nothing is picked
+  // yet or the previous picks no longer exist in the new repo's branch list.
+  useEffect(() => {
+    if (!branches) return;
+    const known = new Set([...branches.local, ...branches.remote].map((b) => b.full));
+    const needsTarget = !target || !known.has(target);
+    const needsSource = !source || !known.has(source);
+    if (!needsTarget && !needsSource) return;
+    const defaults = pickDefaultBranches(branches);
+    if (needsTarget && defaults.target) setTarget(defaults.target.full);
+    if (needsSource && defaults.source) setSource(defaults.source.full);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [branches]);
 
   const isSourceHead = sourceMatchesHead(source, repoInfo?.currentBranch ?? null);
   const scopeLocked = !isSourceHead;
@@ -78,7 +153,8 @@ function App() {
       }) — staged and unstaged changes only exist in the working tree of HEAD.`
     : undefined;
 
-  async function showDiff() {
+  const showDiff = useCallback(async () => {
+    if (!repoPath || !target || !source) return;
     setLoading(true);
     setError(null);
     setSummary(null);
@@ -102,7 +178,19 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [repoPath, target, source, compareMode, sourceScope]);
+
+  // Auto-fetch the summary once target/source (and repo/mode/scope) are all
+  // set, so the user doesn't have to press "Show diff" after every change
+  // (task step 9). The button below stays as an explicit re-fetch.
+  const autoFetchKey = useRef("");
+  useEffect(() => {
+    if (!repoPath || !target || !source) return;
+    const key = JSON.stringify({ repoPath, target, source, compareMode, sourceScope });
+    if (autoFetchKey.current === key) return;
+    autoFetchKey.current = key;
+    showDiff();
+  }, [repoPath, target, source, compareMode, sourceScope, showDiff]);
 
   async function loadFileDiff(file: DiffFile, force: boolean) {
     if (!lastParams) return;
@@ -127,10 +215,31 @@ function App() {
     }
   }
 
+  if (!repoPath) {
+    return (
+      <main className="container empty-state-container">
+        <EmptyState
+          error={projectError}
+          recentProjects={recentProjects}
+          onChoose={chooseRepository}
+          onPickRecent={validateAndSetRepo}
+        />
+      </main>
+    );
+  }
+
   return (
     <main className="container">
       <div className="app-header">
-        <h1>Branch Diff Viewer</h1>
+        <div className="app-header-left">
+          <h1>Branch Diff Viewer</h1>
+          <ProjectChip
+            repoPath={repoPath}
+            recentProjects={recentProjects}
+            onChoose={chooseRepository}
+            onPickRecent={validateAndSetRepo}
+          />
+        </div>
         <button
           type="button"
           className="theme-toggle"
@@ -140,6 +249,8 @@ function App() {
         </button>
       </div>
 
+      {projectError && <p className="error">{projectError}</p>}
+
       <form
         className="diff-form"
         onSubmit={(e) => {
@@ -147,33 +258,21 @@ function App() {
           showDiff();
         }}
       >
-        <label>
-          Repository path
-          <input
-            value={repoPath}
-            onChange={(e) => setRepoPath(e.currentTarget.value)}
-            placeholder="/path/to/repo"
-          />
-        </label>
-        <label>
-          Base (target)
-          <input
+        <div className="branch-row">
+          <BranchDropdown
+            label="Base · target"
+            branches={branches}
             value={target}
-            onChange={(e) => setTarget(e.currentTarget.value)}
-            placeholder="main"
+            onChange={(b) => setTarget(b.full)}
           />
-        </label>
-        <label>
-          Head (source)
-          <input
+          <span className="branch-row-arrow">←</span>
+          <BranchDropdown
+            label="Head · source"
+            branches={branches}
             value={source}
-            onChange={(e) => setSource(e.currentTarget.value)}
-            placeholder="feature/foo"
+            onChange={(b) => setSource(b.full)}
           />
-          {repoInfo?.currentBranch && (
-            <span className="head-hint">HEAD: {repoInfo.currentBranch}</span>
-          )}
-        </label>
+        </div>
 
         <div className="segmented-row">
           <div className="segmented-group">
@@ -205,7 +304,7 @@ function App() {
           <p className="banner banner-warning">{lockReason}</p>
         )}
 
-        <button type="submit" disabled={loading}>
+        <button type="submit" disabled={loading || !target || !source}>
           {loading ? "Loading…" : "Show diff"}
         </button>
       </form>
@@ -368,10 +467,6 @@ function FileDiffPane({
       )}
     </section>
   );
-}
-
-function formatBytes(n: number): string {
-  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 const STATUS_LABEL: Record<string, string> = {

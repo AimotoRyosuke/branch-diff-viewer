@@ -20,6 +20,13 @@ export interface BranchRef {
   isRemote: boolean;
 }
 
+export interface BranchList {
+  local: BranchRef[];
+  remote: BranchRef[];
+  current: string | null; // short name of the checked-out branch; null when detached/unborn
+  lastFetch: string | null; // ISO 8601 mtime of .git/FETCH_HEAD; null if never fetched
+}
+
 export interface DiffParams {
   repoPath: string;
   target: string; // merge target (short or full; normalized internally)

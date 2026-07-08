@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use super::parse::{merge_entries, parse_name_status, parse_numstat, split_nul};
 use super::process::{git_version, run_git, stderr_trimmed, stdout_trimmed};
+use super::refs::normalize_ref;
 use super::types::{
     CompareMode, DiffFile, DiffFileStatus, DiffParams, DiffSummary, DiffTotals, FileContents,
     RepoInfo, SourceScope,
@@ -105,6 +106,12 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
 
     let mut warnings = Vec::new();
 
+    // Normalize both refs to fully-qualified `refs/heads/...` /
+    // `refs/remotes/...` form before they touch any other `git` invocation
+    // (DESIGN.md 3.2 / 8 H-3).
+    let target = normalize_ref(repo, &params.target)?;
+    let source = normalize_ref(repo, &params.source)?;
+
     // HEAD constraint (DESIGN.md 3.3 / 4.1 / 4.2): staged/unstaged only exist
     // in the working tree of whatever is currently checked out. If `source`
     // isn't that branch (always true for a remote-tracking ref), fall back
@@ -112,7 +119,7 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
     let mut effective_scope = params.source_scope;
     if effective_scope != SourceScope::Committed {
         let current_branch = symbolic_ref_short(repo)?;
-        if !source_matches_head(&params.source, current_branch.as_deref()) {
+        if !source_matches_head(&source, current_branch.as_deref()) {
             warnings.push(format!(
                 "source \"{}\" is not the checked-out branch (HEAD is {}) — scope fixed to committed",
                 params.source,
@@ -125,10 +132,8 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
     // First operand of the diff: the merge-base commit (3-dot) or the target
     // tip itself (2-dot) — DESIGN.md 4.1/4.2.
     let base_rev = match params.compare_mode {
-        CompareMode::MergeBase => {
-            compute_merge_base(repo, &params.target, &params.source, &mut warnings)?
-        }
-        CompareMode::Tips => Some(params.target.clone()),
+        CompareMode::MergeBase => compute_merge_base(repo, &target, &source, &mut warnings)?,
+        CompareMode::Tips => Some(target.clone()),
     };
     let Some(base_rev) = base_rev else {
         // No merge base (unrelated histories): DESIGN.md 7 says this is a
@@ -142,7 +147,7 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
     };
 
     let ignore_whitespace = params.options.ignore_whitespace.unwrap_or(true);
-    let scope_args = scope_diff_args(effective_scope, &base_rev, &params.source);
+    let scope_args = scope_diff_args(effective_scope, &base_rev, &source);
 
     // `-w` is intentionally never passed to `--name-status`: empirically (git
     // 2.50) `--name-status -w` still lists whitespace-only-changed files
@@ -208,8 +213,9 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
 
 /// Current checked-out branch's short name (`None` on detached/unborn HEAD),
 /// via `symbolic-ref` rather than `--abbrev-ref` (DESIGN.md 4.3 M-5: the
-/// latter returns the literal string `HEAD` when detached).
-fn symbolic_ref_short(repo: &Path) -> Result<Option<String>, String> {
+/// latter returns the literal string `HEAD` when detached). `pub(super)` so
+/// `branches::list_branches` can reuse it for `BranchList.current`.
+pub(super) fn symbolic_ref_short(repo: &Path) -> Result<Option<String>, String> {
     let out = run_git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     if out.status.success() {
         Ok(Some(stdout_trimmed(&out)))
@@ -218,13 +224,14 @@ fn symbolic_ref_short(repo: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// Whether `source` (short or fully-qualified) refers to the branch
-/// currently checked out (DESIGN.md 3.3 HEAD constraint). A detached/unborn
-/// HEAD (`current_branch = None`) never matches.
+/// Whether `source` (already normalized to a fully-qualified ref by
+/// [`normalize_ref`]) refers to the branch currently checked out (DESIGN.md
+/// 3.3 HEAD constraint). A detached/unborn HEAD (`current_branch = None`)
+/// never matches.
 fn source_matches_head(source: &str, current_branch: Option<&str>) -> bool {
     match current_branch {
         None => false,
-        Some(branch) => source == branch || source == format!("refs/heads/{branch}"),
+        Some(branch) => source == format!("refs/heads/{branch}"),
     }
 }
 
@@ -416,25 +423,29 @@ fn get_file_diff_impl(
         validate_repo_relative_path(op)?;
     }
 
+    // Normalize both refs to fully-qualified form before they touch any
+    // other `git` invocation (DESIGN.md 3.2 / 8 H-3), same as
+    // `get_diff_summary_impl`.
+    let target = normalize_ref(repo, &params.target)?;
+    let source = normalize_ref(repo, &params.source)?;
+
     let base_rev = match params.compare_mode {
         CompareMode::MergeBase => {
             let mut warnings = Vec::new();
-            compute_merge_base(repo, &params.target, &params.source, &mut warnings)?
-                .ok_or_else(|| {
-                    "no merge base found between target and source (unrelated histories?)"
-                        .to_string()
-                })?
+            compute_merge_base(repo, &target, &source, &mut warnings)?.ok_or_else(|| {
+                "no merge base found between target and source (unrelated histories?)".to_string()
+            })?
         }
         // DESIGN.md 4.1/4.2: "tips" compares against the target branch tip
         // directly rather than the merge-base.
-        CompareMode::Tips => params.target.clone(),
+        CompareMode::Tips => target.clone(),
     };
     // Renames read the base side under the old path (task step 1).
     let base_path = old_path.unwrap_or_else(|| path.clone());
     let base_side = Side::Blob(format!("{base_rev}:{base_path}"));
 
     let head_side = match params.source_scope {
-        SourceScope::Committed => Side::Blob(format!("{}:{}", params.source, path)),
+        SourceScope::Committed => Side::Blob(format!("{source}:{path}")),
         // Stage 0 of the index (DESIGN.md 4.3).
         SourceScope::Staged => Side::Blob(format!(":{path}")),
         SourceScope::Unstaged => {
@@ -652,6 +663,23 @@ mod tests {
     fn validate_repo_rejects_non_repo_path() {
         let dir = tempfile::tempdir().unwrap();
         let err = validate_repo_impl(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a git working tree"), "unexpected error: {err}");
+    }
+
+    /// Bare repositories have no working tree, so `--is-inside-work-tree`
+    /// prints `false` (DESIGN.md 3.1 / 7): `validate_repo` must reject them
+    /// explicitly rather than treating exit code 0 as success.
+    #[test]
+    fn validate_repo_rejects_bare_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare_path = dir.path().join("bare.git");
+        let out = Command::new("git")
+            .args(["init", "--bare", bare_path.to_str().unwrap()])
+            .output()
+            .expect("failed to init bare repo for test");
+        assert!(out.status.success(), "git init --bare failed");
+
+        let err = validate_repo_impl(bare_path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("not a git working tree"), "unexpected error: {err}");
     }
 
@@ -1027,6 +1055,64 @@ mod tests {
             "fully-qualified HEAD ref should not trigger fallback: {:?}",
             ok_summary.warnings
         );
+    }
+
+    /// Selecting a remote-tracking branch as `source` by its short name
+    /// (`origin/feature`, not the fully-qualified `refs/remotes/origin/feature`)
+    /// must still resolve via ref normalization and trip the HEAD constraint
+    /// (DESIGN.md 3.2/3.3: a remote-tracking ref can never be the checked-out
+    /// branch).
+    #[test]
+    fn get_diff_summary_normalizes_short_remote_tracking_source_and_locks_scope() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("a.txt"), "feature\n").unwrap();
+        git(repo, &["commit", "-am", "feature change"]);
+
+        let sha = {
+            let out = run_git(repo, &["rev-parse", "feature"]).unwrap();
+            stdout_trimmed(&out)
+        };
+        git(repo, &["update-ref", "refs/remotes/origin/feature", &sha]);
+
+        let mut params = base_params(repo, "main", "origin/feature");
+        params.source_scope = SourceScope::Unstaged;
+        let summary = get_diff_summary_impl(params).unwrap();
+
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("not the checked-out branch")),
+            "expected HEAD-constraint warning, got {:?}",
+            summary.warnings
+        );
+        assert!(
+            summary.files.iter().all(|f| f.is_untracked != Some(true)),
+            "scope should have been fixed to committed, so no untracked merge-in"
+        );
+    }
+
+    /// ref normalization/validation (DESIGN.md 8 H-3) is enforced through the
+    /// public `get_diff_summary`/`get_file_diff` entry points too, not just
+    /// unit-tested in isolation on `refs::normalize_ref`.
+    #[test]
+    fn get_diff_summary_rejects_dash_prefixed_and_nonexistent_refs() {
+        let dir = init_repo();
+        let repo = dir.path();
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        let dash_err =
+            get_diff_summary_impl(base_params(repo, "-main", "main")).unwrap_err();
+        assert!(dash_err.contains("must not start with '-'"), "unexpected error: {dash_err}");
+
+        let missing_err =
+            get_diff_summary_impl(base_params(repo, "main", "does-not-exist")).unwrap_err();
+        assert!(missing_err.contains("not found"), "unexpected error: {missing_err}");
     }
 
     #[test]

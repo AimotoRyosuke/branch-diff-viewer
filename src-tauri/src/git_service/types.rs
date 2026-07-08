@@ -106,6 +106,30 @@ pub struct DiffSummary {
     pub warnings: Vec<String>,
 }
 
+/// One branch entry returned by `list_branches` (DESIGN.md 5).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchRef {
+    /// Display name (e.g. `origin/main`).
+    pub short: String,
+    /// Fully-qualified (`refs/heads/...` / `refs/remotes/...`).
+    pub full: String,
+    pub is_remote: bool,
+}
+
+/// Result of `list_branches` (DESIGN.md 3.2 / 5).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchList {
+    pub local: Vec<BranchRef>,
+    pub remote: Vec<BranchRef>,
+    /// `None` on detached/unborn HEAD.
+    pub current: Option<String>,
+    /// `.git/FETCH_HEAD` mtime as ISO 8601, `None` if it doesn't exist
+    /// (never fetched).
+    pub last_fetch: Option<String>,
+}
+
 /// Result of `get_file_diff`: both sides' full text for one file
 /// (DESIGN.md chapter 5).
 #[derive(Debug, Clone, Serialize)]
