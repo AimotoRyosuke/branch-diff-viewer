@@ -8,6 +8,7 @@ pub fn run() {
             git_service::commands::validate_repo,
             git_service::commands::get_diff_summary,
             git_service::commands::get_file_diff,
+            git_service::commands::get_repo_fingerprint,
             git_service::branches::list_branches,
             git_service::recent::get_recent_projects,
             git_service::recent::add_recent_project,

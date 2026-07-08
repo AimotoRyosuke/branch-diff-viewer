@@ -6,6 +6,9 @@
 //! through `Command`'s argv array (never a shell) with a trailing `--`
 //! pathspec separator on every `diff` invocation (DESIGN.md 4.0 / 8).
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +16,8 @@ use super::parse::{merge_entries, parse_name_status, parse_numstat, split_nul};
 use super::process::{git_version, run_git, stderr_trimmed, stdout_trimmed};
 use super::refs::normalize_ref;
 use super::types::{
-    CompareMode, DiffFile, DiffFileStatus, DiffParams, DiffSummary, DiffTotals, FileContents,
-    RepoInfo, SourceScope,
+    CompareMode, DiffFile, DiffFileStatus, DiffParams, DiffSummary, DiffTotals,
+    FingerprintParams, FileContents, RepoInfo, SourceScope,
 };
 
 const DIFF_GLOBAL_ARGS: &[&str] = &["-c", "core.quotepath=false", "-c", "core.fsmonitor=false"];
@@ -45,6 +48,15 @@ pub fn get_file_diff(
     force: bool,
 ) -> Result<FileContents, String> {
     get_file_diff_impl(params, path, old_path, force)
+}
+
+/// A cheap, read-only "has anything changed?" digest used by the frontend on
+/// window-focus to decide whether to re-run `get_diff_summary` (DESIGN.md
+/// 3.6). Combines the resolved SHAs of `target`/`source`/`HEAD` with a hash
+/// of `git status --porcelain -z` (index + working tree state).
+#[tauri::command]
+pub fn get_repo_fingerprint(params: FingerprintParams) -> Result<String, String> {
+    get_repo_fingerprint_impl(params)
 }
 
 fn validate_repo_impl(path: &str) -> Result<RepoInfo, String> {
@@ -106,6 +118,13 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
 
     let mut warnings = Vec::new();
 
+    // Merge/rebase in progress (DESIGN.md 7 M-6): `--cached` and unmerged
+    // index entries can behave surprisingly while one of these is underway,
+    // so warn rather than silently showing a possibly-misleading diff.
+    if let Some(w) = detect_in_progress_operation(repo)? {
+        warnings.push(w);
+    }
+
     // Normalize both refs to fully-qualified `refs/heads/...` /
     // `refs/remotes/...` form before they touch any other `git` invocation
     // (DESIGN.md 3.2 / 8 H-3).
@@ -143,7 +162,15 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
             summary: DiffTotals { files_changed: 0, additions: 0, deletions: 0 },
             omitted_untracked: None,
             warnings,
+            merge_base: None,
         });
+    };
+
+    // Short SHA of the fork point, exposed to the frontend (DESIGN.md 3.4 /
+    // 5); `null` for `tips` mode, where there is no merge-base involved.
+    let merge_base = match params.compare_mode {
+        CompareMode::MergeBase => Some(short_sha(repo, &base_rev)?),
+        CompareMode::Tips => None,
     };
 
     let ignore_whitespace = params.options.ignore_whitespace.unwrap_or(true);
@@ -177,6 +204,10 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
     let numstat_entries = parse_numstat(&numstat_out.stdout)?;
     let mut files = merge_entries(name_entries, numstat_entries, ignore_whitespace)?;
 
+    // Reclassify mode-160000 (submodule) entries precisely (DESIGN.md 7 M-6)
+    // without touching the name-status/numstat parsing above.
+    mark_submodule_entries(repo, &scope_args, &mut files)?;
+
     // Untracked files only exist "in the working tree" and only make sense
     // to fold in when the scope actually reaches the working tree
     // (DESIGN.md 3.3 / C-3).
@@ -208,7 +239,125 @@ fn get_diff_summary_impl(params: DiffParams) -> Result<DiffSummary, String> {
         files,
         omitted_untracked,
         warnings,
+        merge_base,
     })
+}
+
+/// Detects a merge or rebase in progress via `.git/MERGE_HEAD` /
+/// `rebase-merge` / `rebase-apply`, resolved through `git rev-parse
+/// --git-path` so linked worktrees (which keep those under
+/// `.git/worktrees/<id>/`) are handled correctly (DESIGN.md 7 M-6).
+fn detect_in_progress_operation(repo: &Path) -> Result<Option<String>, String> {
+    if git_path_exists(repo, "MERGE_HEAD")? {
+        return Ok(Some(
+            "a merge is in progress in this repository (MERGE_HEAD present) — the diff, \
+             especially staged/unstaged scopes, may include unmerged/conflicted entries until \
+             it's resolved or aborted"
+                .to_string(),
+        ));
+    }
+    if git_path_exists(repo, "rebase-merge")? || git_path_exists(repo, "rebase-apply")? {
+        return Ok(Some(
+            "a rebase is in progress in this repository — the diff, especially staged/unstaged \
+             scopes, may include unmerged/conflicted entries until it's resolved or aborted"
+                .to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Whether `git rev-parse --git-path <relative>` exists on disk.
+fn git_path_exists(repo: &Path, relative: &str) -> Result<bool, String> {
+    let out = run_git(repo, &["rev-parse", "--git-path", relative])?;
+    if !out.status.success() {
+        // Extremely unlikely (we already validated `repo` is a work tree
+        // elsewhere), but treat as "not present" rather than erroring here.
+        return Ok(false);
+    }
+    let resolved = stdout_trimmed(&out);
+    let resolved_path = Path::new(&resolved);
+    let abs = if resolved_path.is_absolute() { resolved_path.to_path_buf() } else { repo.join(resolved_path) };
+    Ok(abs.exists())
+}
+
+/// Abbreviated form of `sha` via `git rev-parse --short`.
+fn short_sha(repo: &Path, sha: &str) -> Result<String, String> {
+    let out = run_git(repo, &["rev-parse", "--short", sha])?;
+    if !out.status.success() {
+        return Err(format!("failed to abbreviate '{sha}': {}", stderr_trimmed(&out)));
+    }
+    Ok(stdout_trimmed(&out))
+}
+
+/// Cross-references `git diff --raw -z` mode info (old-mode/new-mode) against
+/// the already-merged file list so mode-160000 (submodule) entries are
+/// reclassified as [`DiffFileStatus::Submodule`] (DESIGN.md 7 M-6), without
+/// touching the existing name-status/numstat parser (`--raw` is a separate,
+/// additive invocation).
+fn mark_submodule_entries(
+    repo: &Path,
+    scope_args: &[String],
+    files: &mut [DiffFile],
+) -> Result<(), String> {
+    let raw_out = run_diff(repo, "--raw", scope_args, false)?;
+    if !raw_out.status.success() {
+        return Err(format!("git diff --raw failed: {}", stderr_trimmed(&raw_out)));
+    }
+    let submodule_paths = parse_raw_submodule_paths(&raw_out.stdout)?;
+    if submodule_paths.is_empty() {
+        return Ok(());
+    }
+    for f in files.iter_mut() {
+        if submodule_paths.contains(&f.path) {
+            f.status = DiffFileStatus::Submodule;
+        }
+    }
+    Ok(())
+}
+
+/// Parses `git diff --raw -z` output down to just the set of "new" paths
+/// (post-diff path; for renames, the second of the two paths) whose
+/// old-mode or new-mode is `160000` (a submodule/gitlink entry). Each record
+/// is `:<old-mode> <new-mode> <old-sha> <new-sha> <status>` (space-separated,
+/// NUL-terminated) followed by one NUL-terminated path, or two for a
+/// rename/copy (`status` starting with `R`/`C`) — the same two-vs-one-path
+/// shape as `--name-status -z` (see `parse.rs` module docs).
+fn parse_raw_submodule_paths(bytes: &[u8]) -> Result<HashSet<String>, String> {
+    let tokens = split_nul(bytes);
+    let mut result = HashSet::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let meta = tokens[i].strip_prefix(':').unwrap_or(&tokens[i]);
+        let mut parts = meta.split_whitespace();
+        let old_mode = parts.next().unwrap_or("");
+        let new_mode = parts.next().unwrap_or("");
+        let _old_sha = parts.next();
+        let _new_sha = parts.next();
+        let status = parts.next().unwrap_or("");
+        let is_submodule = old_mode == "160000" || new_mode == "160000";
+        let is_rename_or_copy = status.starts_with('R') || status.starts_with('C');
+        if is_rename_or_copy {
+            if i + 2 >= tokens.len() {
+                return Err(
+                    "malformed --raw output: expected old/new path after rename/copy status"
+                        .to_string(),
+                );
+            }
+            if is_submodule {
+                result.insert(tokens[i + 2].clone());
+            }
+            i += 3;
+        } else {
+            if i + 1 >= tokens.len() {
+                return Err("malformed --raw output: expected path after status".to_string());
+            }
+            if is_submodule {
+                result.insert(tokens[i + 1].clone());
+            }
+            i += 2;
+        }
+    }
+    Ok(result)
 }
 
 /// Current checked-out branch's short name (`None` on detached/unborn HEAD),
@@ -381,26 +530,54 @@ fn run_diff(
         args.push(a.as_str());
     }
     args.push("--");
-    run_git(repo, &args)
+    run_git(repo, &args).map_err(String::from)
 }
 
 /// Where to read one side's (base or head) full text from.
 enum Side {
-    /// A git object reference of the form `<rev>:<path>` or `:<path>`
-    /// (stage 0), read via `git show`/`git cat-file -s`.
-    Blob(String),
+    /// A git object reference: `rev` is a commit-ish, or empty to mean stage
+    /// 0 of the index (`:<path>`). Read via `git show`/`git cat-file -s`/
+    /// `git ls-tree`/`git ls-files -s`.
+    Blob { rev: String, path: String },
     /// A direct working-tree path (already validated to stay inside the
     /// repository root), read via `std::fs`.
     WorkingTree(PathBuf),
 }
 
-/// Outcome of a pre-flight existence/size probe for one [`Side`].
+impl Side {
+    /// `<rev>:<path>` (or `:<path>` when `rev` is empty — index stage 0).
+    fn blob_spec(rev: &str, path: &str) -> String {
+        format!("{rev}:{path}")
+    }
+}
+
+/// Outcome of a pre-flight existence/size probe for one blob [`Side`].
 enum Probe {
-    /// The path does not exist at that revision / in the index / on disk.
-    /// Surfaces as `None` content (added/deleted file) rather than an error
-    /// (DESIGN.md 4.3 task step 1).
+    /// The path does not exist at that revision / in the index. Surfaces as
+    /// `None` content (added/deleted file) rather than an error (DESIGN.md
+    /// 4.3 task step 1).
     Missing,
     Size(u64),
+}
+
+/// A non-regular-file mode detected for one [`Side`] (DESIGN.md 7 M-6):
+/// submodules and symlinks need different content handling than an ordinary
+/// blob/working-tree file, both to avoid dumping inappropriate data into
+/// Monaco and to match what git itself would show.
+enum SpecialMode {
+    Normal,
+    /// mode 120000. Blob-side content already round-trips correctly through
+    /// `git show` (git stores the link target text as the blob content), so
+    /// this only changes the `note`; working-tree-side content is re-read
+    /// via `read_link` instead of `fs::read` (which would otherwise follow
+    /// the link and return the *target file's* content).
+    Symlink,
+    /// mode 160000 (gitlink). Content is synthesized as `"Subproject commit
+    /// <sha>\n"` rather than read normally — a gitlink has no blob to `git
+    /// show`, and a working-tree submodule checkout is a directory, not a
+    /// file. `sha` is `None` when it could not be determined (e.g. an
+    /// uninitialized submodule).
+    Submodule(Option<String>),
 }
 
 fn get_file_diff_impl(
@@ -442,50 +619,60 @@ fn get_file_diff_impl(
     };
     // Renames read the base side under the old path (task step 1).
     let base_path = old_path.unwrap_or_else(|| path.clone());
-    let base_side = Side::Blob(format!("{base_rev}:{base_path}"));
+    let base_side = Side::Blob { rev: base_rev, path: base_path };
 
     let head_side = match params.source_scope {
-        SourceScope::Committed => Side::Blob(format!("{source}:{path}")),
-        // Stage 0 of the index (DESIGN.md 4.3).
-        SourceScope::Staged => Side::Blob(format!(":{path}")),
-        SourceScope::Unstaged => {
-            Side::WorkingTree(safe_join_repo_path(repo, &path)?)
-        }
+        SourceScope::Committed => Side::Blob { rev: source, path: path.clone() },
+        // Stage 0 of the index (DESIGN.md 4.3); `rev = ""` means `:<path>`.
+        SourceScope::Staged => Side::Blob { rev: String::new(), path: path.clone() },
+        SourceScope::Unstaged => Side::WorkingTree(safe_join_repo_path(repo, &path)?),
     };
 
-    let base_probe = probe_side(repo, &base_side)?;
-    let head_probe = probe_side(repo, &head_side)?;
+    let base_mode = detect_special_mode(repo, &base_side)?;
+    let head_mode = detect_special_mode(repo, &head_side)?;
+    // Submodule takes precedence over symlink in the (practically
+    // never-happening) case both sides disagree in kind — it's the more
+    // specific / more consequential annotation for the UI.
+    let note = if matches!(base_mode, SpecialMode::Submodule(_)) || matches!(head_mode, SpecialMode::Submodule(_))
+    {
+        Some("submodule".to_string())
+    } else if matches!(base_mode, SpecialMode::Symlink) || matches!(head_mode, SpecialMode::Symlink) {
+        Some("symlink".to_string())
+    } else {
+        None
+    };
 
-    if !force {
-        let max_size = [&base_probe, &head_probe]
-            .into_iter()
-            .filter_map(|p| match p {
-                Probe::Size(n) => Some(*n),
-                Probe::Missing => None,
-            })
-            .max();
-        if let Some(size) = max_size {
-            if size > MAX_FILE_DIFF_BYTES {
-                return Ok(FileContents {
-                    path,
-                    base: None,
-                    head: None,
-                    is_binary: false,
-                    is_too_large: Some(true),
-                    size_bytes: Some(size),
-                    note: None,
-                });
-            }
-        }
+    let base_result = resolve_side_content(repo, &base_side, &base_mode, force)?;
+    let head_result = resolve_side_content(repo, &head_side, &head_mode, force)?;
+
+    let too_large_size = [&base_result, &head_result]
+        .into_iter()
+        .filter_map(|r| match r {
+            ResolvedSide::TooLarge(n) => Some(*n),
+            _ => None,
+        })
+        .max();
+    if let Some(size) = too_large_size {
+        return Ok(FileContents {
+            path,
+            base: None,
+            head: None,
+            is_binary: false,
+            is_too_large: Some(true),
+            size_bytes: Some(size),
+            note,
+        });
     }
 
-    let base_bytes = match base_probe {
-        Probe::Missing => None,
-        Probe::Size(_) => Some(read_side(repo, &base_side)?),
+    let base_bytes = match base_result {
+        ResolvedSide::Missing => None,
+        ResolvedSide::Bytes(b) => Some(b),
+        ResolvedSide::TooLarge(_) => unreachable!("handled above"),
     };
-    let head_bytes = match head_probe {
-        Probe::Missing => None,
-        Probe::Size(_) => Some(read_side(repo, &head_side)?),
+    let head_bytes = match head_result {
+        ResolvedSide::Missing => None,
+        ResolvedSide::Bytes(b) => Some(b),
+        ResolvedSide::TooLarge(_) => unreachable!("handled above"),
     };
 
     let is_binary = base_bytes.as_deref().is_some_and(looks_binary)
@@ -499,7 +686,7 @@ fn get_file_diff_impl(
             is_binary: true,
             is_too_large: None,
             size_bytes: None,
-            note: None,
+            note,
         });
     }
 
@@ -510,7 +697,7 @@ fn get_file_diff_impl(
         is_binary: false,
         is_too_large: None,
         size_bytes: None,
-        note: None,
+        note,
     })
 }
 
@@ -544,51 +731,164 @@ fn safe_join_repo_path(repo: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(repo.join(path))
 }
 
-/// Probes existence and, when present, byte size of one [`Side`] without
-/// reading its full content (DESIGN.md 4.3 size guard).
-fn probe_side(repo: &Path, side: &Side) -> Result<Probe, String> {
+/// Probes existence and, when present, byte size of one blob side (spec
+/// `<rev>:<path>` / `:<path>`) without reading its full content (DESIGN.md
+/// 4.3 size guard).
+fn probe_blob(repo: &Path, spec: &str) -> Result<Probe, String> {
+    let out = run_git(repo, &["cat-file", "-s", spec])?;
+    if out.status.success() {
+        let stdout = stdout_trimmed(&out);
+        let size: u64 = stdout
+            .parse()
+            .map_err(|_| format!("unexpected `git cat-file -s` output: '{stdout}'"))?;
+        Ok(Probe::Size(size))
+    } else {
+        let err = stderr_trimmed(&out);
+        if is_missing_path_error(&err) {
+            Ok(Probe::Missing)
+        } else {
+            Err(format!("git cat-file -s {spec} failed: {err}"))
+        }
+    }
+}
+
+/// Resolved outcome of reading one [`Side`]'s content, folding the size
+/// guard into the same pass (DESIGN.md 4.3/4.4).
+enum ResolvedSide {
+    Missing,
+    Bytes(Vec<u8>),
+    /// The larger side's size in bytes, when the 1MB guard tripped and
+    /// `force` was not set. Never returned for [`SpecialMode::Submodule`]
+    /// sides — their synthesized content is always tiny.
+    TooLarge(u64),
+}
+
+/// Reads one [`Side`]'s content end-to-end: submodules are synthesized
+/// directly (bypassing the size guard and any blob/fs read — DESIGN.md 7
+/// M-6 "Monaco に巨大データを渡さない"), working-tree symlinks are read via
+/// `read_link` rather than followed, and everything else goes through the
+/// existing probe-then-read path with the 1MB size guard (DESIGN.md 4.3/4.4).
+fn resolve_side_content(
+    repo: &Path,
+    side: &Side,
+    mode: &SpecialMode,
+    force: bool,
+) -> Result<ResolvedSide, String> {
+    if let SpecialMode::Submodule(sha) = mode {
+        let sha_text = sha.as_deref().unwrap_or("unknown");
+        return Ok(ResolvedSide::Bytes(format!("Subproject commit {sha_text}\n").into_bytes()));
+    }
+
     match side {
-        Side::Blob(spec) => {
-            let out = run_git(repo, &["cat-file", "-s", spec])?;
-            if out.status.success() {
-                let stdout = stdout_trimmed(&out);
-                let size: u64 = stdout
-                    .parse()
-                    .map_err(|_| format!("unexpected `git cat-file -s` output: '{stdout}'"))?;
-                Ok(Probe::Size(size))
-            } else {
-                let err = stderr_trimmed(&out);
-                if is_missing_path_error(&err) {
-                    Ok(Probe::Missing)
-                } else {
-                    Err(format!("git cat-file -s {spec} failed: {err}"))
+        Side::Blob { rev, path } => {
+            let spec = Side::blob_spec(rev, path);
+            match probe_blob(repo, &spec)? {
+                Probe::Missing => Ok(ResolvedSide::Missing),
+                Probe::Size(n) => {
+                    if !force && n > MAX_FILE_DIFF_BYTES {
+                        return Ok(ResolvedSide::TooLarge(n));
+                    }
+                    let out = run_git(repo, &["show", &spec])?;
+                    if !out.status.success() {
+                        return Err(format!("git show {spec} failed: {}", stderr_trimmed(&out)));
+                    }
+                    Ok(ResolvedSide::Bytes(out.stdout))
                 }
             }
         }
-        Side::WorkingTree(abs_path) => match std::fs::metadata(abs_path) {
-            Ok(meta) => Ok(Probe::Size(meta.len())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Probe::Missing),
-            Err(e) => Err(format!("failed to stat working tree file: {e}")),
+        Side::WorkingTree(abs_path) => {
+            if matches!(mode, SpecialMode::Symlink) {
+                // Mirrors what git stores as the blob content for a symlink
+                // (the link target text), rather than following the link
+                // and returning the pointed-to file's content.
+                let target = std::fs::read_link(abs_path)
+                    .map_err(|e| format!("failed to read symlink '{}': {e}", abs_path.display()))?;
+                return Ok(ResolvedSide::Bytes(target.to_string_lossy().into_owned().into_bytes()));
+            }
+            match std::fs::metadata(abs_path) {
+                Ok(meta) => {
+                    let n = meta.len();
+                    if !force && n > MAX_FILE_DIFF_BYTES {
+                        return Ok(ResolvedSide::TooLarge(n));
+                    }
+                    let bytes = std::fs::read(abs_path)
+                        .map_err(|e| format!("failed to read working tree file: {e}"))?;
+                    Ok(ResolvedSide::Bytes(bytes))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ResolvedSide::Missing),
+                Err(e) => Err(format!("failed to stat working tree file: {e}")),
+            }
+        }
+    }
+}
+
+/// Determines whether `side` is a submodule (mode 160000) or symlink (mode
+/// 120000) so [`resolve_side_content`] can handle it specially (DESIGN.md 7
+/// M-6). For a [`Side::Blob`], the mode comes from `git ls-tree` (a real
+/// rev) or `git ls-files -s` (the index, when `rev` is empty). For a
+/// [`Side::WorkingTree`] path, only `std::fs` is consulted (never a git
+/// invocation): a symlink is detected via `symlink_metadata`, and a
+/// submodule checkout is approximated as "a directory containing `.git`".
+fn detect_special_mode(repo: &Path, side: &Side) -> Result<SpecialMode, String> {
+    match side {
+        Side::Blob { rev, path } => match lookup_mode(repo, rev, path)? {
+            Some((mode, sha)) if mode == "160000" => Ok(SpecialMode::Submodule(Some(sha))),
+            Some((mode, _)) if mode == "120000" => Ok(SpecialMode::Symlink),
+            _ => Ok(SpecialMode::Normal),
+        },
+        Side::WorkingTree(abs_path) => match std::fs::symlink_metadata(abs_path) {
+            Ok(meta) if meta.file_type().is_symlink() => Ok(SpecialMode::Symlink),
+            Ok(meta) if meta.is_dir() && abs_path.join(".git").exists() => {
+                // Best-effort: read the submodule's own checked-out HEAD via
+                // a separate, still read-only, `git -C <submodule>`
+                // invocation. Falls back to `None` (rendered as "unknown")
+                // rather than failing the whole request.
+                let sha = run_git(abs_path, &["rev-parse", "--short", "HEAD"])
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| stdout_trimmed(&out));
+                Ok(SpecialMode::Submodule(sha))
+            }
+            _ => Ok(SpecialMode::Normal),
         },
     }
 }
 
-/// Reads the full content of one [`Side`]. Only called after [`probe_side`]
-/// reported it as present.
-fn read_side(repo: &Path, side: &Side) -> Result<Vec<u8>, String> {
-    match side {
-        Side::Blob(spec) => {
-            let out = run_git(repo, &["show", spec])?;
-            if out.status.success() {
-                Ok(out.stdout)
-            } else {
-                Err(format!("git show {spec} failed: {}", stderr_trimmed(&out)))
-            }
-        }
-        Side::WorkingTree(abs_path) => {
-            std::fs::read(abs_path).map_err(|e| format!("failed to read working tree file: {e}"))
-        }
+/// Looks up `(mode, blob/commit sha)` for `path` at `rev` (a tree-ish), or
+/// at index stage 0 when `rev` is empty. Returns `Ok(None)` when the path
+/// doesn't exist there — both `git ls-tree`/`git ls-files -s` exit 0 with no
+/// output for a non-matching pathspec, so that's not an error.
+fn lookup_mode(repo: &Path, rev: &str, path: &str) -> Result<Option<(String, String)>, String> {
+    let out = if rev.is_empty() {
+        run_git(repo, &["ls-files", "-s", "-z", "--", path])?
+    } else {
+        run_git(repo, &["ls-tree", "-z", rev, "--", path])?
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "failed to look up mode for '{path}' at '{}': {}",
+            if rev.is_empty() { "<index>" } else { rev },
+            stderr_trimmed(&out)
+        ));
     }
+    let tokens = split_nul(&out.stdout);
+    let Some(first) = tokens.first() else { return Ok(None) };
+    // `ls-tree`: "<mode> <type> <sha>\t<path>"; `ls-files -s`: "<mode> <sha>
+    // <stage>\t<path>" — in both cases the metadata block is everything
+    // before the first tab.
+    let meta = first.split('\t').next().unwrap_or("");
+    let mut parts = meta.split_whitespace();
+    let mode = parts.next().unwrap_or("").to_string();
+    if mode.is_empty() {
+        return Ok(None);
+    }
+    let sha = if rev.is_empty() {
+        parts.next().unwrap_or("unknown").to_string()
+    } else {
+        parts.next(); // skip the object type field
+        parts.next().unwrap_or("unknown").to_string()
+    };
+    Ok(Some((mode, sha)))
 }
 
 /// Matches the handful of git error messages that mean "this path does not
@@ -604,6 +904,72 @@ fn is_missing_path_error(stderr: &str) -> bool {
 fn looks_binary(bytes: &[u8]) -> bool {
     let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
     bytes[..sniff_len].contains(&0u8)
+}
+
+// --- get_repo_fingerprint --------------------------------------------------
+
+fn get_repo_fingerprint_impl(params: FingerprintParams) -> Result<String, String> {
+    let repo = Path::new(&params.repo_path);
+    let meta = std::fs::metadata(repo).map_err(|e| format!("repoPath not accessible: {e}"))?;
+    if !meta.is_dir() {
+        return Err("repoPath is not a directory".to_string());
+    }
+
+    let target = normalize_ref(repo, &params.target)?;
+    let source = normalize_ref(repo, &params.source)?;
+
+    let target_sha = resolve_sha(repo, &target)?;
+    let source_sha = resolve_sha(repo, &source)?;
+    // HEAD is allowed to be unresolvable (unborn branch / empty repo); that
+    // is itself part of the fingerprint's identity, not an error.
+    let head_sha = resolve_sha(repo, "HEAD").unwrap_or_default();
+
+    // `--untracked-files=all` (rather than the default "normal", which
+    // collapses an untracked directory to one line) so a new/changed file
+    // inside an existing untracked directory is reflected in the hash too;
+    // `-c core.fsmonitor=false` for the same "no ambient hook execution"
+    // reason `diff` uses it (DESIGN.md 4.0 H-4). `GIT_OPTIONAL_LOCKS=0`
+    // (set by `run_git` unconditionally) keeps this read-only.
+    let status_out = run_git(
+        repo,
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+        ],
+    )?;
+    if !status_out.status.success() {
+        return Err(format!("git status failed: {}", stderr_trimmed(&status_out)));
+    }
+
+    // `DefaultHasher` (SipHash with fixed, non-randomized keys via `new()`)
+    // is intentionally used instead of a crypto hash: this value is only
+    // ever compared against another value computed in the same running
+    // process (the frontend's window-focus stale check, DESIGN.md 3.6), so
+    // collision-resistance/stability-across-versions isn't a requirement —
+    // just "changes iff the inputs change" — and it avoids adding a new
+    // dependency for what is otherwise a pure change-detector.
+    let mut hasher = DefaultHasher::new();
+    target_sha.hash(&mut hasher);
+    source_sha.hash(&mut hasher);
+    head_sha.hash(&mut hasher);
+    status_out.stdout.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+/// `git rev-parse --verify --quiet <rev>` — the full (not abbreviated) SHA,
+/// or an error when `rev` doesn't resolve (except see the `HEAD` special
+/// case at the call site in [`get_repo_fingerprint_impl`], which tolerates
+/// this for an unborn branch).
+fn resolve_sha(repo: &Path, rev: &str) -> Result<String, String> {
+    let out = run_git(repo, &["rev-parse", "--verify", "--quiet", rev])?;
+    if !out.status.success() {
+        return Err(format!("failed to resolve '{rev}': {}", stderr_trimmed(&out)));
+    }
+    Ok(stdout_trimmed(&out))
 }
 
 #[cfg(test)]
@@ -700,10 +1066,7 @@ mod tests {
             source: source.to_string(),
             compare_mode: CompareMode::MergeBase,
             source_scope: SourceScope::Committed,
-            options: super::super::types::DiffOptions {
-                ignore_whitespace: Some(false),
-                context_lines: None,
-            },
+            options: super::super::types::DiffOptions { ignore_whitespace: Some(false) },
         }
     }
 
@@ -1432,4 +1795,311 @@ mod tests {
                 .unwrap_err();
         assert!(err_old_path.contains("traversal"), "unexpected error: {err_old_path}");
     }
+
+    // --- Phase 6a: merge/rebase-in-progress warning, mergeBase SHA,
+    // submodule/symlink notes, get_repo_fingerprint --------------------------
+
+    /// Runs a git command in `repo` for test setup like [`git`], but doesn't
+    /// assert success — for commands (`merge`, `rebase`) that are expected
+    /// to exit non-zero on a deliberately unresolved conflict.
+    fn git_allow_failure(repo: &Path, args: &[&str]) {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("failed to run git for test setup");
+    }
+
+    /// Two branches that each change the same line of the same file, so
+    /// merging/rebasing one onto the other conflicts and leaves the
+    /// in-progress state on disk (DESIGN.md 7 M-6).
+    fn setup_conflicting_branches_fixture() -> TempDir {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.join("a.txt"), "feature change\n").unwrap();
+        git(repo, &["commit", "-am", "feature change"]);
+
+        git(repo, &["checkout", "main"]);
+        fs::write(repo.join("a.txt"), "main change\n").unwrap();
+        git(repo, &["commit", "-am", "main change"]);
+
+        dir
+    }
+
+    #[test]
+    fn get_diff_summary_warns_when_merge_in_progress() {
+        let dir = setup_conflicting_branches_fixture();
+        let repo = dir.path();
+
+        git_allow_failure(repo, &["merge", "feature"]);
+        assert!(
+            repo.join(".git/MERGE_HEAD").exists(),
+            "fixture setup: expected a conflicting merge to leave MERGE_HEAD"
+        );
+
+        let params = base_params(repo, "main", "feature");
+        let summary = get_diff_summary_impl(params).unwrap();
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("merge is in progress")),
+            "expected merge-in-progress warning, got {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn get_diff_summary_warns_when_rebase_in_progress() {
+        let dir = setup_conflicting_branches_fixture();
+        let repo = dir.path();
+
+        git_allow_failure(repo, &["rebase", "feature"]);
+        assert!(
+            repo.join(".git/rebase-apply").exists() || repo.join(".git/rebase-merge").exists(),
+            "fixture setup: expected a conflicting rebase to leave rebase-apply/rebase-merge"
+        );
+
+        let params = base_params(repo, "main", "feature");
+        let summary = get_diff_summary_impl(params).unwrap();
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("rebase is in progress")),
+            "expected rebase-in-progress warning, got {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn get_diff_summary_has_no_in_progress_warning_on_a_clean_repo() {
+        let dir = setup_conflicting_branches_fixture();
+        let repo = dir.path();
+        let params = base_params(repo, "main", "feature");
+        let summary = get_diff_summary_impl(params).unwrap();
+        assert!(
+            !summary.warnings.iter().any(|w| w.contains("in progress")),
+            "unexpected in-progress warning on a clean repo: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn get_diff_summary_exposes_merge_base_sha_for_merge_base_mode_and_null_for_tips() {
+        let dir = setup_scope_matrix_fixture();
+        let repo = dir.path();
+
+        let full_mb = manual_merge_base(repo, "main", "feature");
+        let expected_short = {
+            let out = run_git(repo, &["rev-parse", "--short", &full_mb]).unwrap();
+            stdout_trimmed(&out)
+        };
+
+        let mb_summary = get_diff_summary_impl(base_params(repo, "main", "feature")).unwrap();
+        assert_eq!(mb_summary.merge_base.as_deref(), Some(expected_short.as_str()));
+
+        let mut tips_params = base_params(repo, "main", "feature");
+        tips_params.compare_mode = CompareMode::Tips;
+        let tips_summary = get_diff_summary_impl(tips_params).unwrap();
+        assert_eq!(tips_summary.merge_base, None);
+    }
+
+    /// Simulates a submodule via `git update-index --add --cacheinfo
+    /// 160000,<sha>,<path>` (DESIGN.md 7 M-6 task hint) rather than a real
+    /// nested repository, since only the gitlink mode matters for
+    /// classification/notes.
+    fn add_fake_submodule(repo: &Path, path: &str, sha: &str) {
+        git(repo, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},{path}")]);
+    }
+
+    #[test]
+    fn get_diff_summary_classifies_submodule_entries() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        let fake_sha = "1".repeat(40);
+        add_fake_submodule(repo, "sub", &fake_sha);
+        git(repo, &["commit", "-m", "add submodule"]);
+
+        let summary = get_diff_summary_impl(base_params(repo, "main", "feature")).unwrap();
+        let sub = summary
+            .files
+            .iter()
+            .find(|f| f.path == "sub")
+            .unwrap_or_else(|| panic!("missing submodule entry in {:#?}", summary.files));
+        assert_eq!(sub.status, DiffFileStatus::Submodule);
+    }
+
+    #[test]
+    fn get_file_diff_returns_submodule_note_and_subproject_commit_line() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        let fake_sha = "2".repeat(40);
+        add_fake_submodule(repo, "sub", &fake_sha);
+        git(repo, &["commit", "-m", "add submodule"]);
+
+        let params = base_params(repo, "main", "feature");
+        let fc = get_file_diff_impl(params, "sub".to_string(), None, false).unwrap();
+
+        assert_eq!(fc.note.as_deref(), Some("submodule"));
+        // Doesn't exist on main.
+        assert_eq!(fc.base, None);
+        assert_eq!(fc.head.as_deref(), Some(format!("Subproject commit {fake_sha}\n").as_str()));
+        assert!(!fc.is_binary);
+        assert_eq!(fc.is_too_large, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_file_diff_returns_symlink_note_for_a_committed_symlink() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        std::os::unix::fs::symlink("target/path.txt", repo.join("link.txt")).unwrap();
+        git(repo, &["add", "link.txt"]);
+        git(repo, &["commit", "-m", "add symlink"]);
+
+        let params = base_params(repo, "main", "feature");
+        let fc = get_file_diff_impl(params, "link.txt".to_string(), None, false).unwrap();
+
+        assert_eq!(fc.note.as_deref(), Some("symlink"));
+        assert_eq!(fc.base, None);
+        // git stores the link target text as the blob content — `git show`
+        // already returns it correctly for the committed side.
+        assert_eq!(fc.head.as_deref(), Some("target/path.txt"));
+    }
+
+    /// Working-tree-side symlinks must be read via `read_link` (the stored
+    /// link text), not `fs::read` (which would follow the link and return
+    /// the pointed-to file's content) — DESIGN.md 7 M-6.
+    #[cfg(unix)]
+    #[test]
+    fn get_file_diff_working_tree_symlink_reads_link_text_not_followed_content() {
+        let dir = init_repo();
+        let repo = dir.path();
+
+        fs::write(repo.join("link.txt"), "was a regular file\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        fs::write(repo.join("real_target.txt"), "REAL TARGET CONTENT\n").unwrap();
+        fs::remove_file(repo.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("real_target.txt", repo.join("link.txt")).unwrap();
+        // Left unstaged on purpose: SourceScope::Unstaged reads the working
+        // tree directly.
+
+        let mut params = base_params(repo, "main", "feature");
+        params.source_scope = SourceScope::Unstaged;
+        let fc = get_file_diff_impl(params, "link.txt".to_string(), None, false).unwrap();
+
+        assert_eq!(fc.note.as_deref(), Some("symlink"));
+        assert_eq!(fc.head.as_deref(), Some("real_target.txt"));
+    }
+
+    // --- get_repo_fingerprint -----------------------------------------------
+
+    fn fingerprint_params(repo: &Path, target: &str, source: &str) -> FingerprintParams {
+        FingerprintParams {
+            repo_path: repo.to_str().unwrap().to_string(),
+            target: target.to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    #[test]
+    fn get_repo_fingerprint_is_stable_when_nothing_changes() {
+        let dir = init_repo();
+        let repo = dir.path();
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        let params = fingerprint_params(repo, "main", "feature");
+        let fp1 = get_repo_fingerprint_impl(params.clone()).unwrap();
+        let fp2 = get_repo_fingerprint_impl(params).unwrap();
+        assert_eq!(fp1, fp2, "fingerprint must be stable when nothing in the repo changed");
+    }
+
+    #[test]
+    fn get_repo_fingerprint_changes_when_source_gets_a_new_commit() {
+        let dir = init_repo();
+        let repo = dir.path();
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        let params = fingerprint_params(repo, "main", "feature");
+        let before = get_repo_fingerprint_impl(params.clone()).unwrap();
+
+        fs::write(repo.join("a.txt"), "feature change\n").unwrap();
+        git(repo, &["commit", "-am", "feature change"]);
+
+        let after = get_repo_fingerprint_impl(params).unwrap();
+        assert_ne!(before, after, "a new commit on source must change the fingerprint");
+    }
+
+    #[test]
+    fn get_repo_fingerprint_changes_when_working_tree_changes_without_a_commit() {
+        let dir = init_repo();
+        let repo = dir.path();
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        let params = fingerprint_params(repo, "main", "feature");
+        let before = get_repo_fingerprint_impl(params.clone()).unwrap();
+
+        // Unstaged edit only: target/source/HEAD SHAs are unchanged, but
+        // `git status` output differs — this is exactly the "someone edited
+        // a file in another terminal" case DESIGN.md 3.6 targets.
+        fs::write(repo.join("a.txt"), "unstaged edit\n").unwrap();
+
+        let after = get_repo_fingerprint_impl(params).unwrap();
+        assert_ne!(before, after, "an unstaged working-tree edit must change the fingerprint");
+    }
+
+    #[test]
+    fn get_repo_fingerprint_changes_when_a_new_untracked_file_appears() {
+        let dir = init_repo();
+        let repo = dir.path();
+        fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["checkout", "-b", "feature"]);
+
+        let params = fingerprint_params(repo, "main", "feature");
+        let before = get_repo_fingerprint_impl(params.clone()).unwrap();
+
+        fs::write(repo.join("new_untracked.txt"), "brand new\n").unwrap();
+
+        let after = get_repo_fingerprint_impl(params).unwrap();
+        assert_ne!(before, after, "a new untracked file must change the fingerprint");
+    }
+
 }

@@ -42,9 +42,6 @@ pub enum SourceScope {
 pub struct DiffOptions {
     /// Defaults to `true` (Hide whitespace ON) per DESIGN.md 3.5.
     pub ignore_whitespace: Option<bool>,
-    /// Patch-context only; unused by the full-text Monaco view (kept for
-    /// wire-format parity with DESIGN.md 5).
-    pub context_lines: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,6 +101,23 @@ pub struct DiffSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omitted_untracked: Option<u32>,
     pub warnings: Vec<String>,
+    /// Short SHA of the `git merge-base <target> <source>` fork point when
+    /// `compareMode == "merge-base"`; always `null` for `"tips"` (DESIGN.md
+    /// 3.4 / 5).
+    pub merge_base: Option<String>,
+}
+
+/// Input to `get_repo_fingerprint` (DESIGN.md 3.6): a cheap, read-only
+/// change-detector used on window-focus to decide whether `get_diff_summary`
+/// needs to be re-run. Deliberately narrower than [`DiffParams`] — it only
+/// needs enough to resolve `target`/`source`/HEAD and the working tree
+/// status, not the compare mode / scope / display options.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintParams {
+    pub repo_path: String,
+    pub target: String,
+    pub source: String,
 }
 
 /// One branch entry returned by `list_branches` (DESIGN.md 5).
