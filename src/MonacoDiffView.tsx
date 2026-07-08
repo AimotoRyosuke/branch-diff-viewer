@@ -10,6 +10,17 @@ export interface MonacoDiffViewProps {
   /** Head (modified / source) full text. */
   modified: string;
   theme: "light" | "dark";
+  /** Hide-whitespace toggle → Monaco `ignoreTrimWhitespace` (DESIGN.md 3.5
+   * "各ファイルの2ペイン表示は ignoreTrimWhitespace で近似"). */
+  ignoreWhitespace: boolean;
+  /** Soft-wrap long lines (diff-pane header "Wrap" toggle). */
+  wrap: boolean;
+  /** Called after each diff (re)computation with whether Monaco gave up early
+   * — i.e. the two sides differ but no line-level changes were produced within
+   * `maxComputationTime` (DESIGN.md 4.4 / design 3e/5f). Monaco 0.55 doesn't
+   * expose `getDiffComputationResult().quitEarly`, so this is approximated as
+   * "models differ but getLineChanges() is null". */
+  onTimeoutChange?: (timedOut: boolean) => void;
 }
 
 /**
@@ -18,13 +29,23 @@ export interface MonacoDiffViewProps {
  * is fed in. The editor is created once and reused; models are swapped when the
  * selected file changes and disposed to avoid leaks.
  */
-export function MonacoDiffView({ path, original, modified, theme }: MonacoDiffViewProps) {
+export function MonacoDiffView({
+  path,
+  original,
+  modified,
+  theme,
+  ignoreWhitespace,
+  wrap,
+  onTimeoutChange,
+}: MonacoDiffViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<monaco.editor.IStandaloneDiffEditor | null>(null);
   const modelsRef = useRef<{
     original: monaco.editor.ITextModel;
     modified: monaco.editor.ITextModel;
   } | null>(null);
+  const onTimeoutRef = useRef(onTimeoutChange);
+  onTimeoutRef.current = onTimeoutChange;
 
   // Create the diff editor once.
   useEffect(() => {
@@ -34,7 +55,7 @@ export function MonacoDiffView({ path, original, modified, theme }: MonacoDiffVi
       originalEditable: false,
       automaticLayout: true,
       renderSideBySide: true,
-      ignoreTrimWhitespace: true, // Hide-whitespace approximation (DESIGN.md 3.5)
+      ignoreTrimWhitespace: true, // updated by an effect below
       maxComputationTime: 5000, // fall back to plain render on huge diffs (4.4)
       theme: theme === "dark" ? BDV_DARK : BDV_LIGHT,
       scrollBeyondLastLine: false,
@@ -44,7 +65,20 @@ export function MonacoDiffView({ path, original, modified, theme }: MonacoDiffVi
     });
     editorRef.current = editor;
 
+    // Approximate Monaco's `quitEarly` (not exposed in 0.55): after each
+    // recomputation, if the two sides differ yet no line changes came back,
+    // the computation was truncated by `maxComputationTime` (DESIGN.md 4.4).
+    const sub = editor.onDidUpdateDiff(() => {
+      const m = editor.getModel();
+      if (!m) return;
+      const differ = m.original.getValue() !== m.modified.getValue();
+      const changes = editor.getLineChanges();
+      const timedOut = differ && (changes === null || changes.length === 0);
+      onTimeoutRef.current?.(timedOut);
+    });
+
     return () => {
+      sub.dispose();
       editor.dispose();
       modelsRef.current?.original.dispose();
       modelsRef.current?.modified.dispose();
@@ -70,6 +104,15 @@ export function MonacoDiffView({ path, original, modified, theme }: MonacoDiffVi
     previous?.original.dispose();
     previous?.modified.dispose();
   }, [path, original, modified]);
+
+  // Hide-whitespace + wrap toggles (cheap live updates, no editor recreate).
+  useEffect(() => {
+    editorRef.current?.updateOptions({
+      ignoreTrimWhitespace: ignoreWhitespace,
+      diffWordWrap: wrap ? "on" : "off",
+      wordWrap: wrap ? "on" : "off",
+    });
+  }, [ignoreWhitespace, wrap]);
 
   // React to theme toggles (setTheme is global to all Monaco editors).
   useEffect(() => {

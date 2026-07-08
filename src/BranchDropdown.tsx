@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BranchList, BranchRef } from "./types";
 import { useClickOutside } from "./useClickOutside";
-import { formatRelativeTime } from "./utils";
+import { formatRelativeShort, formatRelativeTime } from "./utils";
 
 /** Branch picker used for both Base (target) and Head (source) — DESIGN.md
  * 3.2 / docs/design "Branch Diff Viewer UI.dc.html" state 3b: Local /
@@ -13,12 +13,18 @@ export function BranchDropdown({
   branches,
   value,
   onChange,
+  role,
 }: {
   label: string;
   branches: BranchList | null;
   /** Currently selected branch's fully-qualified ref, or "" if none. */
   value: string;
   onChange: (branch: BranchRef) => void;
+  /** Which control-bar slot this is: "base" shows a remote selection as a
+   * `remote · <last-fetch>` badge, "head" shows `HEAD` (blue) for the
+   * checked-out branch or `Remote` (yellow) otherwise (docs/design Prototype
+   * control bar). */
+  role: "base" | "head";
 }) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
@@ -61,7 +67,14 @@ export function BranchDropdown({
       >
         <span className="branch-dropdown-value">{displayText}</span>
         {selected && isCurrentHead(selected) && <span className="badge badge-head">HEAD</span>}
-        {selected?.isRemote && <span className="badge badge-remote">remote</span>}
+        {selected?.isRemote &&
+          (role === "base" ? (
+            <span className="badge badge-remote">
+              remote{formatRelativeShort(branches?.lastFetch ?? null) && ` · ${formatRelativeShort(branches?.lastFetch ?? null)}`}
+            </span>
+          ) : (
+            <span className="badge badge-remote">Remote</span>
+          ))}
         <span className="branch-dropdown-arrow">{open ? "▲" : "▼"}</span>
       </button>
 
