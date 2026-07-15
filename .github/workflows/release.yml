@@ -26,6 +26,14 @@ jobs:
       - name: install frontend dependencies
         run: npm install
 
+      - name: derive release asset name
+        id: meta
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # GitHub replaces spaces in release asset filenames with dots in the download URL.
+          product_name=$(jq -r '.productName' src-tauri/tauri.conf.json | tr ' ' '.')
+          echo "dmg_name=${product_name}_${version}_universal.dmg" >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,6 +41,9 @@ jobs:
           args: --target universal-apple-darwin
           tagName: ${{ github.ref_name }}
           releaseName: 'Branch Diff Viewer ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download this version.'
+          releaseBody: |
+            **[⬇ Download for macOS (Universal — Intel & Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.meta.outputs.dmg_name }})**
+
+            See the Assets below for other files.
           releaseDraft: true
           prerelease: false

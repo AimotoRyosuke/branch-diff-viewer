@@ -7,7 +7,9 @@
 [![Latest release](https://img.shields.io/github/v/release/AimotoRyosuke/branch-diff-viewer)](https://github.com/AimotoRyosuke/branch-diff-viewer/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/AimotoRyosuke/branch-diff-viewer)](LICENSE)
 
-プルリクエストを作成した後もコミットや編集を続けていると、GitHub上の差分は実態を表さなくなります——実際のワーキングツリーは、いつの間にかそこから乖離しているからです。Branch Diff Viewerは、あなたのブランチとマージ先の間にある本当の・現在の差分を表示し、未コミット・ステージ済み・未追跡の変更も必要に応じて含めることができます。差分の計算はシステムの`git`を直接呼び出して行い、フォークポイントは`merge-base`で解決するため、表示される内容はGitHubのPRと同じ三点リーダー（three-dot）ロジックに従います。おなじみのMonacoによるサイドバイサイド表示でレンダリングされます。
+**ブランチの本当の差分を確認できます——まだコミットしていない変更も含めて。**
+
+GitHub のPR差分はpush済みの内容しか見せてくれません。Branch Diff Viewerは、あなたのブランチとマージ先の間にある本当の・現在の差分を、実際のワーキングツリー（未コミットの変更を含む）と比較して表示します。コミットする前にマージ先との差分を確認できます。
 
 ![Branch Diff Viewer (light theme)](assets/screenshot-light.png)
 

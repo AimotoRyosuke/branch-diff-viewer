@@ -7,7 +7,9 @@ A desktop app for reviewing the diff between two Git branches — including the 
 [![Latest release](https://img.shields.io/github/v/release/AimotoRyosuke/branch-diff-viewer)](https://github.com/AimotoRyosuke/branch-diff-viewer/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/AimotoRyosuke/branch-diff-viewer)](LICENSE)
 
-Once you keep committing and editing after opening a pull request, the diff on GitHub stops telling the whole story — your actual working tree has quietly drifted from it. Branch Diff Viewer shows the real, current difference between your branch and its merge target, with uncommitted, staged, and untracked changes included on demand. It computes diffs by invoking your system `git` directly and resolves the fork point with `merge-base`, so what you see follows the same three-dot logic as a GitHub PR — rendered in a familiar side-by-side Monaco view.
+**See the real diff of your branch — including changes you haven't committed yet.**
+
+GitHub's PR diff only shows what you've pushed. Branch Diff Viewer shows the actual, current difference between your branch and its merge target, comparing against your real working tree, uncommitted changes included. Check the diff against your merge target before you even commit.
 
 ![Branch Diff Viewer (light theme)](assets/screenshot-light.png)
 
