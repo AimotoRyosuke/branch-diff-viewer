@@ -40,7 +40,7 @@ jobs:
         with:
           args: --target universal-apple-darwin
           tagName: ${{ github.ref_name }}
-          releaseName: 'Branch Diff Viewer ${{ github.ref_name }}'
+          releaseName: ${{ github.ref_name }}
           releaseBody: |
             **[⬇ Download for macOS (Universal — Intel & Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.meta.outputs.dmg_name }})**
 
