@@ -1,6 +1,6 @@
 [package]
 name = "branch-diff-viewer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Branch Diff Viewer"
 edition = "2021"
 
