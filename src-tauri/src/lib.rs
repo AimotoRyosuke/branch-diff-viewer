@@ -12,6 +12,8 @@ pub fn run() {
             git_service::branches::list_branches,
             git_service::recent::get_recent_projects,
             git_service::recent::add_recent_project,
+            git_service::settings::get_ui_settings,
+            git_service::settings::set_ui_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

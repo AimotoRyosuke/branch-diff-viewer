@@ -12,6 +12,7 @@ import type {
   FileContents,
   RepoInfo,
   SourceScope,
+  UiSettings,
 } from "./types";
 import { MonacoDiffView } from "./MonacoDiffView";
 import { ControlBar } from "./ControlBar";
@@ -116,6 +117,15 @@ function App() {
 
   useEffect(() => {
     invoke<string[]>("get_recent_projects").then(setRecentProjects).catch(() => {});
+    invoke<UiSettings>("get_ui_settings")
+      .then((s) => setHideWhitespace(s.hideWhitespace))
+      .catch(() => {});
+  }, []);
+
+  const updateHideWhitespace = useCallback((value: boolean) => {
+    setHideWhitespace(value);
+    const settings: UiSettings = { hideWhitespace: value };
+    invoke("set_ui_settings", { settings }).catch(() => {});
   }, []);
 
   const validateAndSetRepo = useCallback(async (path: string) => {
@@ -392,7 +402,7 @@ function App() {
         compareMode={compareMode}
         onCompareMode={setCompareMode}
         hideWhitespace={hideWhitespace}
-        onHideWhitespace={setHideWhitespace}
+        onHideWhitespace={updateHideWhitespace}
         scopeLocked={scopeLocked}
         lockReason={lockReason}
         headText={sourceShort}
@@ -477,7 +487,7 @@ function App() {
             onRetryFile={() =>
               selectedFile && lastParams && loadFileDiff(selectedFile, !!fileContents?.isTooLarge, lastParams)
             }
-            onShowWhitespace={() => setHideWhitespace(false)}
+            onShowWhitespace={() => updateHideWhitespace(false)}
             onTimeoutChange={setTimedOut}
           />
         </div>

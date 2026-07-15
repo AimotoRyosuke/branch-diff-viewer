@@ -6,6 +6,7 @@
 pub mod branches;
 pub mod commands;
 pub mod recent;
+pub mod settings;
 mod parse;
 mod process;
 mod refs;

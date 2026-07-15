@@ -96,3 +96,7 @@ export interface FileContents {
   sizeBytes?: number;
   note?: string; // e.g. submodule / symlink / mode-only change
 }
+
+export interface UiSettings {
+  hideWhitespace: boolean; // default true (DESIGN.md 3.5)
+}
