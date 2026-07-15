@@ -11,7 +11,7 @@ A desktop app for reviewing the diff between two Git branches — including the 
 
 GitHub's PR diff only shows what you've pushed. Branch Diff Viewer shows the actual, current difference between your branch and its merge target, comparing against your real working tree, uncommitted changes included. Check the diff against your merge target before you even commit.
 
-![Branch Diff Viewer (light theme)](assets/screenshot-light.png)
+![Branch Diff Viewer demo — switching between Committed, Staged, and Unstaged](assets/demo.gif)
 
 ![Branch Diff Viewer (dark theme)](assets/screenshot-dark.png)
 
