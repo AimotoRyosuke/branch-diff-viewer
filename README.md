@@ -1,12 +1,27 @@
 # Branch Diff Viewer
 
+[日本語版はこちら](README.ja.md)
+
 A desktop app for reviewing the diff between two Git branches — including the changes you haven't committed yet.
 
-When you keep working locally after opening a PR, it gets hard to see how your working tree actually differs from the merge target. Branch Diff Viewer shows exactly that: pick a base branch and a source branch, choose how much of your local state to include, and review the diff in a familiar side-by-side view.
+[![Latest release](https://img.shields.io/github/v/release/AimotoRyosuke/branch-diff-viewer)](https://github.com/AimotoRyosuke/branch-diff-viewer/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/AimotoRyosuke/branch-diff-viewer)](LICENSE)
+
+Once you keep committing and editing after opening a pull request, the diff on GitHub stops telling the whole story — your actual working tree has quietly drifted from it. Branch Diff Viewer shows the real, current difference between your branch and its merge target, with uncommitted, staged, and untracked changes included on demand. It computes diffs by invoking your system `git` directly and resolves the fork point with `merge-base`, so what you see follows the same three-dot logic as a GitHub PR — rendered in a familiar side-by-side Monaco view.
 
 ![Branch Diff Viewer (light theme)](assets/screenshot-light.png)
 
 ![Branch Diff Viewer (dark theme)](assets/screenshot-dark.png)
+
+## Table of contents
+
+- [Features](#features)
+- [Install](#install)
+- [Usage](#usage)
+- [How it works](#how-it-works)
+- [Development](#development)
+- [Limitations](#limitations)
+- [License](#license)
 
 ## Features
 
@@ -19,7 +34,11 @@ When you keep working locally after opening a PR, it gets hard to see how your w
 
 ## Install
 
-**macOS**: build the DMG (see below) or grab a locally built one from `src-tauri/target/release/bundle/dmg/`, then drag the app to Applications.
+### Download (macOS)
+
+Grab the latest `.dmg` from the [Releases page](https://github.com/AimotoRyosuke/branch-diff-viewer/releases/latest), open it, and drag the app to Applications.
+
+The app isn't code-signed yet, so macOS Gatekeeper will block the first launch with an "unidentified developer" warning. To open it anyway: right-click (or Control-click) the app in Applications, choose **Open**, then confirm **Open** in the dialog. This is only needed the first time.
 
 Windows and Linux are supported by the stack but bundles have not been verified yet.
 
