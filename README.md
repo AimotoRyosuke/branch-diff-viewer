@@ -13,17 +13,19 @@ GitHub's PR diff only shows what you've pushed. Branch Diff Viewer shows the act
 
 ![Branch Diff Viewer demo — switching between Committed, Staged, and Unstaged](assets/demo.gif)
 
-![Branch Diff Viewer (dark theme)](assets/screenshot-dark.png)
-
 ## Table of contents
 
-- [Features](#features)
-- [Install](#install)
-- [Usage](#usage)
-- [How it works](#how-it-works)
-- [Development](#development)
-- [Limitations](#limitations)
-- [License](#license)
+- [Branch Diff Viewer](#branch-diff-viewer)
+  - [Table of contents](#table-of-contents)
+  - [Features](#features)
+  - [Install](#install)
+    - [Download (macOS)](#download-macos)
+    - [Build from source](#build-from-source)
+  - [Usage](#usage)
+  - [How it works](#how-it-works)
+  - [Development](#development)
+  - [Limitations](#limitations)
+  - [License](#license)
 
 ## Features
 
@@ -58,11 +60,13 @@ npm run tauri build   # bundles under src-tauri/target/release/bundle/
 1. **Choose repository…** — pick any local Git repository (recent projects are remembered).
 2. **Base / Head** — select the merge target (e.g. `main`, `origin/main`) and the source branch. Local and remote-tracking branches are both listed; remote refs reflect the last fetch — the app never fetches.
 3. **Source scope** — how much of the source side to include:
-   | Scope | Includes |
-   |---|---|
-   | Committed | committed changes only (PR equivalent) |
-   | Staged | committed + staged (`git add`-ed) |
-   | Unstaged | committed + staged + unstaged + untracked |
+
+   | Scope     | Includes                                  |
+   | --------- | ----------------------------------------- |
+   | Committed | committed changes only (PR equivalent)    |
+   | Staged    | committed + staged (`git add`-ed)         |
+   | Unstaged  | committed + staged + unstaged + untracked |
+
    Staged/Unstaged are only available when the source branch is the checked-out `HEAD` — working-tree changes don't exist anywhere else.
 4. **Compare** — `merge-base` (default, PR-style three-dot) or `tips` (plain two-dot).
 5. Click a file to view its diff. <kbd>↑</kbd>/<kbd>↓</kbd> moves through files, <kbd>⌘R</kbd> refreshes. The view also refreshes automatically when the window regains focus and the repository has changed.
@@ -75,11 +79,11 @@ All diffs are computed by your system `git` (spawned directly, never through a s
 MB = git merge-base <target> <source>
 ```
 
-| Scope | merge-base compare | tips compare |
-|---|---|---|
+| Scope     | merge-base compare     | tips compare                 |
+| --------- | ---------------------- | ---------------------------- |
 | Committed | `git diff MB <source>` | `git diff <target> <source>` |
-| Staged | `git diff --cached MB` | `git diff --cached <target>` |
-| Unstaged | `git diff MB` | `git diff <target>` |
+| Staged    | `git diff --cached MB` | `git diff --cached <target>` |
+| Unstaged  | `git diff MB`          | `git diff <target>`          |
 
 Untracked files are merged in separately via `git ls-files --others --exclude-standard` (capped at 100 entries). Every invocation runs with `--no-ext-diff`, `core.fsmonitor=false`, and `GIT_OPTIONAL_LOCKS=0`, so opening an untrusted repository cannot execute arbitrary commands or take locks.
 
