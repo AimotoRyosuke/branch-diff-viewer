@@ -34,7 +34,7 @@ export function EmptyState({
       ) : (
         <p className="empty-state-subtitle">
           Compare a source branch against its merge target — including staged, unstaged and
-          untracked changes.
+          untracked changes. Whitespace-only diffs are hidden by default.
         </p>
       )}
 
